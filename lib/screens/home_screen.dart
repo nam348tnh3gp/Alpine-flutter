@@ -15,7 +15,7 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   late final PRootService _proot;
   final Terminal _terminal = Terminal(maxLines: 5000);
-  final FocusNode _terminalFocus = FocusNode(); // Thêm FocusNode
+  final FocusNode _terminalFocusNode = FocusNode();
   bool _installed = false;
   bool _installing = false;
   double _progress = 0;
@@ -31,7 +31,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
-    _terminalFocus.dispose();
+    _terminalFocusNode.dispose();
     super.dispose();
   }
 
@@ -58,9 +58,8 @@ class _HomeScreenState extends State<HomeScreen> {
       _mode = RunMode.cli;
       _running = true;
     });
-    // Yêu cầu focus ngay khi terminal hiện
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      FocusScope.of(context).requestFocus(_terminalFocus);
+      FocusScope.of(context).requestFocus(_terminalFocusNode);
     });
     await _proot.start(
       command: ['/bin/sh', '-l'],
@@ -75,7 +74,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _running = true;
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      FocusScope.of(context).requestFocus(_terminalFocus);
+      FocusScope.of(context).requestFocus(_terminalFocusNode);
     });
     await _proot.start(
       command: ['/bin/sh', '/usr/local/bin/start-gui.sh'],
@@ -105,17 +104,9 @@ class _HomeScreenState extends State<HomeScreen> {
           if (_installed && _mode == null) _buildModePicker(),
           if (_running)
             Expanded(
-              child: Focus(
-                focusNode: _terminalFocus,
-                onKey: (node, event) {
-                  // Gửi sự kiện phím vào terminal
-                  if (event is RawKeyDownEvent) {
-                    _terminal.input(event);
-                    return KeyEventResult.handled;
-                  }
-                  return KeyEventResult.ignored;
-                },
-                child: TerminalView(_terminal),
+              child: TerminalView(
+                _terminal,
+                focusNode: _terminalFocusNode,
               ),
             ),
         ],
