@@ -1,0 +1,126 @@
+name: Build Alpine Runner APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  FLUTTER_VERSION: "3.22.2"
+  KOTLIN_VERSION: "1.8.22"
+  JAVA_VERSION: "17"
+  APP_NAME: "alpine_runner"
+  ORG: "com.example"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo (chứa lib/, pubspec.yaml, overrides/, scripts/)
+        uses: actions/checkout@v4
+
+      - name: Setup Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Tạo project Flutter mới (khung android/ios chuẩn)
+        run: |
+          flutter create --org ${{ env.ORG }} --project-name ${{ env.APP_NAME }} --platforms=android build_workspace
+          flutter --version
+
+      - name: Copy source code (lib/, pubspec.yaml) vào project mới, GHI ĐÈ
+        run: |
+          rm -rf build_workspace/lib
+          cp -r lib build_workspace/lib
+          cp -f pubspec.yaml build_workspace/pubspec.yaml
+
+      - name: Ghi đè cấu hình Android (build.gradle, Manifest, MainActivity, jniLibs)
+        run: |
+          set -e
+          # AndroidManifest + MainActivity + build.gradle tuỳ chỉnh
+          cp -f overrides/android/app/src/main/AndroidManifest.xml \
+                build_workspace/android/app/src/main/AndroidManifest.xml
+
+          mkdir -p build_workspace/android/app/src/main/kotlin/${ORG//./\/}/${APP_NAME}
+          cp -f overrides/android/app/src/main/kotlin/com/example/alpinerunner/MainActivity.kt \
+                build_workspace/android/app/src/main/kotlin/${ORG//./\/}/${APP_NAME}/MainActivity.kt
+
+          cp -f overrides/android/app/build.gradle build_workspace/android/app/build.gradle
+          cp -f overrides/android/build.gradle build_workspace/android/build.gradle
+
+          # Xoá package MainActivity mặc định do `flutter create` sinh ra (nếu khác namespace)
+          find build_workspace/android/app/src/main/kotlin -name "MainActivity.kt" \
+            -not -path "*${APP_NAME}/MainActivity.kt" -delete || true
+        env:
+          ORG: ${{ env.ORG }}
+          APP_NAME: ${{ env.APP_NAME }}
+
+      - name: sed - ép Kotlin version = 1.8.22 trong toàn bộ gradle files
+        run: |
+          set -e
+          grep -rl "kotlin_version" build_workspace/android --include="*.gradle" | while read -r f; do
+            sed -i "s/ext.kotlin_version *= *['\"][^'\"]*['\"]/ext.kotlin_version = '${KOTLIN_VERSION}'/g" "$f"
+          done
+          # Đảm bảo settings.gradle dùng đúng kotlin plugin version (Flutter template mới dùng declarative plugin block)
+          if [ -f build_workspace/android/settings.gradle ]; then
+            sed -i "s/id \"org.jetbrains.kotlin.android\" version \"[^\"]*\"/id \"org.jetbrains.kotlin.android\" version \"${KOTLIN_VERSION}\"/" \
+              build_workspace/android/settings.gradle || true
+          fi
+
+      - name: Copy script khởi động GUI vào assets (sẽ chép vào rootfs lúc bootstrap)
+        run: |
+          mkdir -p build_workspace/assets/rootfs-scripts
+          cp overrides/rootfs-scripts/start-gui.sh build_workspace/assets/rootfs-scripts/start-gui.sh
+          # đăng ký asset trong pubspec.yaml nếu chưa có
+          if ! grep -q "assets/rootfs-scripts/" build_workspace/pubspec.yaml; then
+            python3 - <<'PY'
+import re
+p = "build_workspace/pubspec.yaml"
+s = open(p).read()
+if "flutter:\n  uses-material-design: true\n" in s:
+    s = s.replace(
+        "flutter:\n  uses-material-design: true\n",
+        "flutter:\n  uses-material-design: true\n  assets:\n    - assets/rootfs-scripts/start-gui.sh\n"
+    )
+open(p, "w").write(s)
+PY
+          fi
+
+      - name: Tải native binaries (proot, busybox) -> jniLibs/lib*.so
+        working-directory: build_workspace
+        run: |
+          cp -f ../scripts/fetch_native_binaries.sh .
+          chmod +x fetch_native_binaries.sh
+          ./fetch_native_binaries.sh
+
+      - name: flutter pub get
+        working-directory: build_workspace
+        run: flutter pub get
+
+      - name: Kiểm tra ABI filter & extractNativeLibs đã đúng
+        working-directory: build_workspace
+        run: |
+          grep -q "arm64-v8a" android/app/build.gradle
+          grep -q "armeabi-v7a" android/app/build.gradle
+          grep -q 'extractNativeLibs="true"' android/app/src/main/AndroidManifest.xml
+
+      - name: Build APK release (split theo ABI)
+        working-directory: build_workspace
+        run: flutter build apk --release --split-per-abi
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: alpine-runner-apk
+          path: |
+            build_workspace/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error

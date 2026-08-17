@@ -1,0 +1,79 @@
+plugins {
+    id "com.android.application"
+    id "kotlin-android"
+    id "dev.flutter.flutter-gradle-plugin"
+}
+
+def localProperties = new Properties()
+def localPropertiesFile = rootProject.file('local.properties')
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.withReader('UTF-8') { reader ->
+        localProperties.load(reader)
+    }
+}
+
+def flutterRoot = localProperties.getProperty('flutter.sdk')
+if (flutterRoot == null) {
+    throw new GradleException("flutter.sdk not set in local.properties")
+}
+
+apply from: "$flutterRoot/packages/flutter_tools/gradle/flutter.gradle"
+
+android {
+    namespace "com.example.alpinerunner"
+    compileSdk 34
+    ndkVersion "25.2.9519653"
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    defaultConfig {
+        applicationId "com.example.alpinerunner"
+        minSdkVersion 26
+        targetSdkVersion 34
+        versionCode flutterVersionCode.toInteger()
+        versionName flutterVersionName
+
+        ndk {
+            // Chỉ build 2 arch theo yêu cầu: arm64 và arm32
+            abiFilters "arm64-v8a", "armeabi-v7a"
+        }
+    }
+
+    // QUAN TRỌNG cho việc "lách" W^X:
+    // Bắt buộc extract lib*.so ra đĩa (nativeLibraryDir) thay vì chạy thẳng từ
+    // trong APK nén (uncompressed mmap). Không có dòng này, trên 1 số máy các
+    // binary giả lib*.so vẫn có thể exec được, nhưng để an toàn/đồng nhất ta
+    // ép legacy packaging + extractNativeLibs="true" trong AndroidManifest.
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = true
+            // Không strip/optimize để tránh hỏng ELF binary không phải lib thật
+            keepDebugSymbols += ["**/*.so"]
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.debug
+            minifyEnabled false
+            shrinkResources false
+        }
+    }
+
+    sourceSets {
+        main.jniLibs.srcDirs = ['src/main/jniLibs']
+    }
+}
+
+flutter {
+    source '../..'
+}
+
+dependencies {}
