@@ -5,17 +5,9 @@ import 'package:archive/archive_io.dart';
 import 'package:http/http.dart' as http;
 import 'native_bridge.dart';
 
-/// Quản lý toàn bộ vòng đời: tải rootfs Alpine (lần đầu mở app),
-/// giải nén, và chạy proot KHÔNG chroot, KHÔNG cần root, dùng file
-/// thực thi lấy từ nativeLibraryDir (libproot.so, libtalloc.so, libbusybox.so...).
-///
-/// LƯU Ý: các URL download bên dưới là VÍ DỤ và PHẢI được bạn xác minh còn
-/// hoạt động (Alpine đổi version thường xuyên). Xem README.md mục
-/// "Cập nhật nguồn tải rootfs".
 class PRootService {
   static const _alpineVersion = '3.20.3';
 
-  /// Map arch Android -> tên arch Alpine dùng trong URL minirootfs.
   static const _alpineArchMap = {
     'arm64-v8a': 'aarch64',
     'armeabi-v7a': 'armv7',
@@ -36,8 +28,6 @@ class PRootService {
     return File('$rootfs/etc/alpine-release').existsSync();
   }
 
-  /// Tải + giải nén Alpine minirootfs lần đầu chạy app.
-  /// Chạy song song stream log ra UI qua [onLog].
   Future<void> bootstrap({required void Function(double) onProgress}) async {
     final abi = await NativeBridge.getAbi();
     final alpineArch = _alpineArchMap[abi] ?? 'aarch64';
@@ -85,20 +75,20 @@ class PRootService {
     }
     File(tarGzPath).deleteSync();
 
-    // Thư mục runtime bắt buộc cho proot bind-mount
-    for (final d in ['proc', 'sys', 'dev', 'tmp', 'root']) {
+    // Tạo các thư mục cần thiết
+    for (final d in ['proc', 'sys', 'dev', 'tmp', 'root', 'bin', 'lib']) {
       Directory('$rootfs/$d').createSync(recursive: true);
     }
 
-    // DNS cơ bản trong rootfs
+    // Tạo symlink /bin/sh -> busybox (sẽ được mount từ native libs)
+    // Thay vì tạo symlink, ta sẽ dùng busybox trực tiếp trong command
+
+    // DNS
     File('$rootfs/etc/resolv.conf').writeAsStringSync('nameserver 8.8.8.8\n');
 
     onLog('Hoàn tất cài đặt Alpine rootfs tại: $rootfs');
   }
 
-  /// Chạy shell (CLI) hoặc script khởi động X server + VNC (GUI) bên trong proot.
-  /// [extraArgs] ví dụ: ['/bin/sh', '-l'] cho CLI, hoặc
-  /// ['/usr/local/bin/start-gui.sh'] cho GUI.
   Future<Process> start({
     required List<String> command,
     void Function(String)? onStdout,
@@ -112,8 +102,15 @@ class PRootService {
     final tmpDir = '$filesDir/proot-tmp';
     Directory(tmpDir).createSync(recursive: true);
 
+    // Nếu command là /bin/sh, thay bằng busybox (vì libbusybox.so đã có)
+    List<String> finalCommand = List.from(command);
+    if (finalCommand.isNotEmpty && finalCommand[0] == '/bin/sh') {
+      // Dùng busybox để chạy shell
+      finalCommand = ['/bin/busybox', 'sh', '-l'];
+    }
+
     final args = <String>[
-      '-0', // fake root bên trong (không cần root máy thật)
+      '-0',
       '--link2symlink',
       '--kill-on-exit',
       '-r', rootfs,
@@ -121,8 +118,9 @@ class PRootService {
       '-b', '/proc',
       '-b', '/sys',
       '-b', '$tmpDir:/tmp',
+      '-b', '$libDir:/host-libs',        // Mount thư mục native libs vào /host-libs
       '-w', '/root',
-      ...command,
+      ...finalCommand,
     ];
 
     onLog('Khởi chạy: $prootBin ${args.join(' ')}');
@@ -133,7 +131,8 @@ class PRootService {
       environment: {
         'PROOT_TMP_DIR': tmpDir,
         'PROOT_LOADER': '$libDir/libprootloader.so',
-        'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+        'LD_LIBRARY_PATH': '/host-libs',   // Linker tìm thư viện tại đây
+        'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/host-libs',
         'HOME': '/root',
         'TERM': 'xterm-256color',
       },
@@ -141,8 +140,21 @@ class PRootService {
     );
 
     _currentProcess = process;
-    process.stdout.transform(utf8.decoder).listen((s) => onStdout?.call(s));
-    process.stderr.transform(utf8.decoder).listen((s) => onStderr?.call(s));
+    process.stdout.transform(utf8.decoder).listen((s) {
+      onStdout?.call(s);
+      // Log để debug
+      print('STDOUT: $s');
+    });
+    process.stderr.transform(utf8.decoder).listen((s) {
+      onStderr?.call(s);
+      print('STDERR: $s');
+    });
+
+    // Khi process kết thúc, cập nhật trạng thái
+    process.exitCode.then((code) {
+      onLog('Process exited with code $code');
+    });
+
     return process;
   }
 
