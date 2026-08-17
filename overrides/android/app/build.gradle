@@ -22,8 +22,12 @@ android {
         applicationId = "com.example.alpinerunner"
         minSdk = 26
         targetSdk = flutter.targetSdkVersion
-        versionCode = flutter.versionCode
-        versionName = flutter.versionName
+        // KHÔNG dùng flutter.versionCode / flutter.versionName: property này
+        // được thêm/đổi cách expose (property vs method) qua lại giữa các
+        // bản Flutter Gradle Plugin gần đây và gây lỗi "unknown property"
+        // tuỳ đúng version pin. App nội bộ nên hardcode thẳng cho chắc.
+        versionCode = 1
+        versionName = "1.0.0"
 
         ndk {
             // Chỉ build 2 arch theo yêu cầu: arm64 và arm32
