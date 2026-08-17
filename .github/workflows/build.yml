@@ -43,10 +43,10 @@ jobs:
           cp -r lib build_workspace/lib
           cp -f pubspec.yaml build_workspace/pubspec.yaml
 
-      - name: Ghi đè cấu hình Android (build.gradle, Manifest, MainActivity, jniLibs)
+      - name: Ghi đè cấu hình Android (Manifest, MainActivity, app/build.gradle)
         run: |
           set -e
-          # AndroidManifest + MainActivity + build.gradle tuỳ chỉnh
+          # AndroidManifest + MainActivity tuỳ chỉnh
           cp -f overrides/android/app/src/main/AndroidManifest.xml \
                 build_workspace/android/app/src/main/AndroidManifest.xml
 
@@ -54,8 +54,11 @@ jobs:
           cp -f overrides/android/app/src/main/kotlin/com/example/alpinerunner/MainActivity.kt \
                 build_workspace/android/app/src/main/kotlin/${ORG//./\/}/${APP_NAME}/MainActivity.kt
 
+          # CHỈ ghi đè app/build.gradle. KHÔNG động vào android/build.gradle hay
+          # android/settings.gradle -- giữ nguyên bản `flutter create` sinh ra vì
+          # template Flutter 3.22 quản lý AGP/Kotlin qua settings.gradle
+          # (declarative plugins block), không dùng flutterVersionCode kiểu cũ nữa.
           cp -f overrides/android/app/build.gradle build_workspace/android/app/build.gradle
-          cp -f overrides/android/build.gradle build_workspace/android/build.gradle
 
           # Xoá package MainActivity mặc định do `flutter create` sinh ra (nếu khác namespace)
           find build_workspace/android/app/src/main/kotlin -name "MainActivity.kt" \
@@ -64,24 +67,46 @@ jobs:
           ORG: ${{ env.ORG }}
           APP_NAME: ${{ env.APP_NAME }}
 
-      - name: sed - ép Kotlin version = 1.8.22 trong toàn bộ gradle files
+      - name: sed - ép Kotlin version = 1.8.22 trong settings.gradle (template mới)
         run: |
           set -e
-          grep -rl "kotlin_version" build_workspace/android --include="*.gradle" | while read -r f; do
-            sed -i "s/ext.kotlin_version *= *['\"][^'\"]*['\"]/ext.kotlin_version = '${KOTLIN_VERSION}'/g" "$f"
-          done
-          # Đảm bảo settings.gradle dùng đúng kotlin plugin version (Flutter template mới dùng declarative plugin block)
-          if [ -f build_workspace/android/settings.gradle ]; then
-            sed -i "s/id \"org.jetbrains.kotlin.android\" version \"[^\"]*\"/id \"org.jetbrains.kotlin.android\" version \"${KOTLIN_VERSION}\"/" \
-              build_workspace/android/settings.gradle || true
-          fi
+          # Template Flutter 3.22 khai báo kotlin version trong pluginManagement
+          # ở android/settings.gradle, dạng:
+          #   id "org.jetbrains.kotlin.android" version "x.x.x" apply false
+          sed -i -E "s/(id \"org\.jetbrains\.kotlin\.android\" version )\"[^\"]*\"/\1\"${KOTLIN_VERSION}\"/" \
+            build_workspace/android/settings.gradle
+          echo "Kết quả sau khi sed:"
+          grep "org.jetbrains.kotlin.android" build_workspace/android/settings.gradle
 
       - name: Copy script khởi động GUI vào assets (sẽ chép vào rootfs lúc bootstrap)
         run: |
+          set -e
           mkdir -p build_workspace/assets/rootfs-scripts
           cp overrides/rootfs-scripts/start-gui.sh build_workspace/assets/rootfs-scripts/start-gui.sh
-          # đăng ký asset trong pubspec.yaml nếu chưa có (script riêng, không nhúng heredoc trong YAML)
-          python3 scripts/patch_pubspec_assets.py build_workspace/pubspec.yaml
+
+          # Đăng ký asset trong pubspec.yaml nếu chưa có.
+          # Lưu ý: toàn bộ heredoc bên dưới phải thụt lề >= thụt lề của "run: |"
+          # (10 spaces) để không bị YAML hiểu nhầm là kết thúc block scalar.
+          if ! grep -q "assets/rootfs-scripts/" build_workspace/pubspec.yaml; then
+            python3 - <<'PY'
+          import re
+          p = "build_workspace/pubspec.yaml"
+          s = open(p).read()
+          target = "flutter:\n  uses-material-design: true\n"
+          replacement = (
+              "flutter:\n"
+              "  uses-material-design: true\n"
+              "  assets:\n"
+              "    - assets/rootfs-scripts/start-gui.sh\n"
+          )
+          if target in s:
+              s = s.replace(target, replacement)
+          else:
+              s += "\n  assets:\n    - assets/rootfs-scripts/start-gui.sh\n"
+          open(p, "w").write(s)
+          print("Đã thêm asset vào pubspec.yaml")
+          PY
+          fi
 
       - name: Tải native binaries (proot, busybox) -> jniLibs/lib*.so
         working-directory: build_workspace
