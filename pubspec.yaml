@@ -15,7 +15,7 @@ dependencies:
   # Ghim CỨNG (không dùng ^) - xterm 3.5.0+ đổi sang API bàn phím KeyEvent
   # mới, gây lỗi kiểu "RawKeyEvent can't be assigned to KeyEvent" khi build
   # với Flutter SDK 3.22.x. Bản 3.4.0 tương thích ổn định với Flutter 3.22.
-  xterm: 3.4.0
+  xterm: ^4.0.0
   url_launcher: ^6.3.0
   http: ^1.2.1
   archive: ^3.6.1
