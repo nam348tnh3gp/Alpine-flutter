@@ -15,6 +15,7 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   late final PRootService _proot;
   final Terminal _terminal = Terminal(maxLines: 5000);
+  final FocusNode _terminalFocus = FocusNode(); // Thêm FocusNode
   bool _installed = false;
   bool _installing = false;
   double _progress = 0;
@@ -26,6 +27,12 @@ class _HomeScreenState extends State<HomeScreen> {
     super.initState();
     _proot = PRootService(onLog: (l) => _terminal.write('$l\r\n'));
     _checkInstalled();
+  }
+
+  @override
+  void dispose() {
+    _terminalFocus.dispose();
+    super.dispose();
   }
 
   Future<void> _checkInstalled() async {
@@ -51,6 +58,10 @@ class _HomeScreenState extends State<HomeScreen> {
       _mode = RunMode.cli;
       _running = true;
     });
+    // Yêu cầu focus ngay khi terminal hiện
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      FocusScope.of(context).requestFocus(_terminalFocus);
+    });
     await _proot.start(
       command: ['/bin/sh', '-l'],
       onStdout: (s) => _terminal.write(s),
@@ -63,7 +74,9 @@ class _HomeScreenState extends State<HomeScreen> {
       _mode = RunMode.gui;
       _running = true;
     });
-    // start-gui.sh: khởi động Xvfb (:1) + x11vnc trên cổng 5900, xem scripts/start-gui.sh
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      FocusScope.of(context).requestFocus(_terminalFocus);
+    });
     await _proot.start(
       command: ['/bin/sh', '/usr/local/bin/start-gui.sh'],
       onStdout: (s) => _terminal.write(s),
@@ -74,7 +87,6 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _openRealVnc() async {
-    // RealVNC Viewer trên Android hỗ trợ deep link vnc://
     final uri = Uri.parse('vnc://127.0.0.1:5900');
     if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
       _terminal.write(
@@ -91,7 +103,21 @@ class _HomeScreenState extends State<HomeScreen> {
         children: [
           if (!_installed) _buildInstallPanel(),
           if (_installed && _mode == null) _buildModePicker(),
-          if (_running) Expanded(child: TerminalView(_terminal)),
+          if (_running)
+            Expanded(
+              child: Focus(
+                focusNode: _terminalFocus,
+                onKey: (node, event) {
+                  // Gửi sự kiện phím vào terminal
+                  if (event is RawKeyDownEvent) {
+                    _terminal.input(event);
+                    return KeyEventResult.handled;
+                  }
+                  return KeyEventResult.ignored;
+                },
+                child: TerminalView(_terminal),
+              ),
+            ),
         ],
       ),
     );
