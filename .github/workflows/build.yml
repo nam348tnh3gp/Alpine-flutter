@@ -80,20 +80,8 @@ jobs:
         run: |
           mkdir -p build_workspace/assets/rootfs-scripts
           cp overrides/rootfs-scripts/start-gui.sh build_workspace/assets/rootfs-scripts/start-gui.sh
-          # đăng ký asset trong pubspec.yaml nếu chưa có
-          if ! grep -q "assets/rootfs-scripts/" build_workspace/pubspec.yaml; then
-            python3 - <<'PY'
-import re
-p = "build_workspace/pubspec.yaml"
-s = open(p).read()
-if "flutter:\n  uses-material-design: true\n" in s:
-    s = s.replace(
-        "flutter:\n  uses-material-design: true\n",
-        "flutter:\n  uses-material-design: true\n  assets:\n    - assets/rootfs-scripts/start-gui.sh\n"
-    )
-open(p, "w").write(s)
-PY
-          fi
+          # đăng ký asset trong pubspec.yaml nếu chưa có (script riêng, không nhúng heredoc trong YAML)
+          python3 scripts/patch_pubspec_assets.py build_workspace/pubspec.yaml
 
       - name: Tải native binaries (proot, busybox) -> jniLibs/lib*.so
         working-directory: build_workspace
