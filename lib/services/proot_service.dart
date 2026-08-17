@@ -34,14 +34,19 @@ class PRootService {
     final rootfs = await _rootfsDir();
     final filesDir = await NativeBridge.getFilesDir();
 
+    // Xóa rootfs cũ nếu có
+    if (await Directory(rootfs).exists()) {
+      await Directory(rootfs).delete(recursive: true);
+    }
     Directory(rootfs).createSync(recursive: true);
 
+    // 🔥 THAY ĐỔI: Dùng alpine-standard thay vì minirootfs
     final url = 'https://dl-cdn.alpinelinux.org/alpine/v${_alpineVersion.substring(0, 4)}/'
-        'releases/$alpineArch/alpine-minirootfs-$_alpineVersion-$alpineArch.tar.gz';
+        'releases/$alpineArch/alpine-standard-$_alpineVersion-$alpineArch.tar.gz';
 
-    onLog('Đang tải Alpine minirootfs ($alpineArch)...\n$url');
+    onLog('Đang tải Alpine standard rootfs ($alpineArch)...\n$url');
 
-    final tarGzPath = '$filesDir/alpine-minirootfs.tar.gz';
+    final tarGzPath = '$filesDir/alpine-rootfs.tar.gz';
     final request = http.Request('GET', Uri.parse(url));
     final response = await http.Client().send(request);
 
@@ -75,13 +80,10 @@ class PRootService {
     }
     File(tarGzPath).deleteSync();
 
-    // Tạo các thư mục cần thiết
-    for (final d in ['proc', 'sys', 'dev', 'tmp', 'root', 'bin', 'lib']) {
+    // Tạo thư mục runtime cho proot
+    for (final d in ['proc', 'sys', 'dev', 'tmp', 'root']) {
       Directory('$rootfs/$d').createSync(recursive: true);
     }
-
-    // Tạo symlink /bin/sh -> busybox (sẽ được mount từ native libs)
-    // Thay vì tạo symlink, ta sẽ dùng busybox trực tiếp trong command
 
     // DNS
     File('$rootfs/etc/resolv.conf').writeAsStringSync('nameserver 8.8.8.8\n');
@@ -102,13 +104,7 @@ class PRootService {
     final tmpDir = '$filesDir/proot-tmp';
     Directory(tmpDir).createSync(recursive: true);
 
-    // Nếu command là /bin/sh, thay bằng busybox (vì libbusybox.so đã có)
-    List<String> finalCommand = List.from(command);
-    if (finalCommand.isNotEmpty && finalCommand[0] == '/bin/sh') {
-      // Dùng busybox để chạy shell
-      finalCommand = ['/bin/busybox', 'sh', '-l'];
-    }
-
+    // 🔥 KHÔNG CẦN chuyển đổi command nữa, rootfs đã có /bin/sh
     final args = <String>[
       '-0',
       '--link2symlink',
@@ -118,9 +114,8 @@ class PRootService {
       '-b', '/proc',
       '-b', '/sys',
       '-b', '$tmpDir:/tmp',
-      '-b', '$libDir:/host-libs',        // Mount thư mục native libs vào /host-libs
       '-w', '/root',
-      ...finalCommand,
+      ...command,
     ];
 
     onLog('Khởi chạy: $prootBin ${args.join(' ')}');
@@ -131,8 +126,8 @@ class PRootService {
       environment: {
         'PROOT_TMP_DIR': tmpDir,
         'PROOT_LOADER': '$libDir/libprootloader.so',
-        'LD_LIBRARY_PATH': '/host-libs',   // Linker tìm thư viện tại đây
-        'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/host-libs',
+        // 🔥 KHÔNG CẦN LD_LIBRARY_PATH vì rootfs có thư viện riêng
+        'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
         'HOME': '/root',
         'TERM': 'xterm-256color',
       },
@@ -142,7 +137,6 @@ class PRootService {
     _currentProcess = process;
     process.stdout.transform(utf8.decoder).listen((s) {
       onStdout?.call(s);
-      // Log để debug
       print('STDOUT: $s');
     });
     process.stderr.transform(utf8.decoder).listen((s) {
@@ -150,7 +144,6 @@ class PRootService {
       print('STDERR: $s');
     });
 
-    // Khi process kết thúc, cập nhật trạng thái
     process.exitCode.then((code) {
       onLog('Process exited with code $code');
     });
