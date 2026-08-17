@@ -1,6 +1,6 @@
 #!/bin/bash
-# fetch_native_binaries.sh
 # Tự động tải proot, busybox và toàn bộ thư viện phụ thuộc từ Termux repo.
+# Chạy trong GitHub Actions.
 # Các binary được đặt vào jniLibs/<abi>/lib*.so để Android có thể load.
 
 set -euo pipefail
@@ -52,7 +52,7 @@ fetch_package_file() {
     fi
     local target_file="$target_dir/$target_name"
 
-    # Kiểm tra nếu đã có file với cùng tên .so (có thể bỏ qua)
+    # Kiểm tra nếu đã có file
     if [ -f "$target_file" ] && [ -s "$target_file" ]; then
         echo "$target_file"
         return 0
@@ -95,7 +95,7 @@ get_needed_libs() {
     readelf -d "$file" 2>/dev/null | grep NEEDED | sed -E 's/.*\[(.*)\]/\1/'
 }
 
-# Kiểm tra xem một thư viện có phải hệ thống không
+# Kiểm tra thư viện có phải hệ thống không
 is_system_lib() {
     local lib="$1"
     for sys in "${SYSTEM_LIBS[@]}"; do
@@ -106,13 +106,12 @@ is_system_lib() {
     return 1
 }
 
-# Xác định package chứa một thư viện (bằng cách suy đoán)
+# Xác định package chứa một thư viện
 resolve_package_for_lib() {
     local lib_name="$1"
-    # Loại bỏ phần .so.* để lấy tên cơ bản
-    local base="${lib_name%%.so*}"        # ví dụ libtalloc
-    local pkg_candidate="${base#lib}"     # talloc
-    # Thử package có tên libpkg (thường gặp)
+    local base="${lib_name%%.so*}"
+    local pkg_candidate="${base#lib}"
+    # Thử package libpkg
     if termux_deb_url "$termux_arch" "lib$pkg_candidate" >/dev/null 2>&1; then
         echo "lib$pkg_candidate"
         return 0
@@ -120,8 +119,7 @@ resolve_package_for_lib() {
         echo "$pkg_candidate"
         return 0
     else
-        # Một số ngoại lệ: libutil -> package libutil, libpcre -> libpcre, ...
-        # Thử thêm một số ánh xạ cứng
+        # Ánh xạ cứng cho một số trường hợp đặc biệt
         case "$lib_name" in
             libutil.so.*) echo "libutil" ;;
             libpcre.so.*) echo "libpcre" ;;
@@ -132,7 +130,86 @@ resolve_package_for_lib() {
     fi
 }
 
-# ---------- Bước 1: Cài patchelf (nếu chưa có) ----------
+# ---------- Hàm xử lý NEEDED (toàn bộ logic, không dùng local ngoài hàm) ----------
+process_needed() {
+    declare -A PATCHED_FILES
+    local CHANGED=false
+
+    while true; do
+        CHANGED=false
+        for file in "$JNI_DIR"/*/*.so; do
+            [ -f "$file" ] || continue
+            local abi_dir="$(dirname "$file")"
+            local abi="$(basename "$abi_dir")"
+            local termux_arch
+            for k in "${!ARCH_MAP[@]}"; do
+                if [ "${ARCH_MAP[$k]}" = "$abi" ]; then
+                    termux_arch="$k"
+                    break
+                fi
+            done
+
+            local needed_libs=( $(get_needed_libs "$file") )
+            for need in "${needed_libs[@]}"; do
+                if is_system_lib "$need"; then
+                    continue
+                fi
+
+                local base_name="${need%%.so*}"
+                local found_file=""
+                for existing in "$abi_dir"/*.so; do
+                    local existing_base="${existing%%.so*}"
+                    if [ "$(basename "$existing_base")" = "$base_name" ]; then
+                        found_file="$existing"
+                        break
+                    fi
+                done
+
+                if [ -n "$found_file" ]; then
+                    local target_name="$(basename "$found_file")"
+                    if [ "$need" != "$target_name" ]; then
+                        if [ -z "${PATCHED_FILES[$file]}" ]; then
+                            echo "Patch $file: thay $need -> $target_name"
+                            patchelf --replace-needed "$need" "$target_name" "$file"
+                            PATCHED_FILES["$file"]=1
+                        fi
+                    fi
+                    continue
+                fi
+
+                echo "Cần tải thư viện: $need"
+                local pkg_name
+                pkg_name="$(resolve_package_for_lib "$need")"
+                if [ -z "$pkg_name" ]; then
+                    echo "!! Không xác định được package cho $need, bỏ qua." >&2
+                    continue
+                fi
+
+                local file_path="lib/$need"
+                local new_file
+                if new_file="$(fetch_package_file "$termux_arch" "$pkg_name" "$file_path")"; then
+                    CHANGED=true
+                    local new_name="$(basename "$new_file")"
+                    if [ "$need" != "$new_name" ]; then
+                        if [ -z "${PATCHED_FILES[$file]}" ]; then
+                            echo "Patch $file: thay $need -> $new_name"
+                            patchelf --replace-needed "$need" "$new_name" "$file"
+                            PATCHED_FILES["$file"]=1
+                        fi
+                    fi
+                else
+                    echo "!! Không tải được package $pkg_name cho $need." >&2
+                fi
+            done
+        done
+
+        if [ "$CHANGED" = false ]; then
+            break
+        fi
+    done
+}
+
+# ---------- Bước 1: Cài patchelf ----------
 if ! command -v patchelf &>/dev/null; then
     echo "patchelf chưa có, đang cài đặt..."
     sudo apt-get update && sudo apt-get install -y patchelf
@@ -147,96 +224,11 @@ for termux_arch in aarch64 arm; do
     done
 done
 
-# ---------- Bước 3: Xử lý đệ quy các NEEDED ----------
+# ---------- Bước 3: Xử lý NEEDED ----------
 echo "=== Xử lý các thư viện phụ thuộc ==="
-# Mảng lưu các file đã được patch (tránh patch lại)
-declare -A PATCHED_FILES
+process_needed
 
-# Vòng lặp vô hạn, sẽ dừng khi không còn NEEDED mới
-while true; do
-    CHANGED=false
-    # Duyệt tất cả file .so trong JNI_DIR
-    for file in "$JNI_DIR"/*/*.so; do
-        [ -f "$file" ] || continue
-        local abi_dir="$(dirname "$file")"
-        local abi="$(basename "$abi_dir")"
-        local termux_arch
-        for k in "${!ARCH_MAP[@]}"; do
-            if [ "${ARCH_MAP[$k]}" = "$abi" ]; then
-                termux_arch="$k"
-                break
-            fi
-        done
-
-        local needed_libs=( $(get_needed_libs "$file") )
-        for need in "${needed_libs[@]}"; do
-            # Bỏ qua thư viện hệ thống
-            if is_system_lib "$need"; then
-                continue
-            fi
-
-            # Kiểm tra xem đã có file .so nào khớp trong cùng thư mục chưa
-            # Tên need có thể là libtalloc.so.2, ta so sánh với các file có tên libtalloc.so
-            local base_name="${need%%.so*}"   # libtalloc
-            local found_file=""
-            for existing in "$abi_dir"/*.so; do
-                local existing_base="${existing%%.so*}"
-                if [ "$(basename "$existing_base")" = "$base_name" ]; then
-                    found_file="$existing"
-                    break
-                fi
-            done
-
-            if [ -n "$found_file" ]; then
-                # Đã có file, nhưng nếu tên NEEDED khác tên file, cần patch
-                local target_name="$(basename "$found_file")"
-                if [ "$need" != "$target_name" ]; then
-                    # Patch file hiện tại để tham chiếu đến tên đúng
-                    if [ -z "${PATCHED_FILES[$file]}" ]; then
-                        echo "Patch $file: thay $need -> $target_name"
-                        patchelf --replace-needed "$need" "$target_name" "$file"
-                        PATCHED_FILES["$file"]=1
-                    fi
-                fi
-                continue
-            fi
-
-            # Chưa có, cần tải package chứa thư viện này
-            echo "Cần tải thư viện: $need"
-            local pkg_name
-            pkg_name="$(resolve_package_for_lib "$need")"
-            if [ -z "$pkg_name" ]; then
-                echo "!! Không xác định được package cho $need, bỏ qua." >&2
-                continue
-            fi
-
-            # Xác định đường dẫn file trong package (thường là lib/ + tên thư viện)
-            local file_path="lib/$need"
-            local new_file
-            if new_file="$(fetch_package_file "$termux_arch" "$pkg_name" "$file_path")"; then
-                CHANGED=true
-                # Sau khi tải xong, patch file hiện tại để tham chiếu đến tên mới (nếu khác)
-                local new_name="$(basename "$new_file")"
-                if [ "$need" != "$new_name" ]; then
-                    if [ -z "${PATCHED_FILES[$file]}" ]; then
-                        echo "Patch $file: thay $need -> $new_name"
-                        patchelf --replace-needed "$need" "$new_name" "$file"
-                        PATCHED_FILES["$file"]=1
-                    fi
-                fi
-            else
-                echo "!! Không tải được package $pkg_name cho $need." >&2
-            fi
-        done
-    done
-
-    # Nếu không có thay đổi mới, thoát vòng lặp
-    if [ "$CHANGED" = false ]; then
-        break
-    fi
-done
-
-# ---------- Bước 4: Kiểm tra ELF hợp lệ ----------
+# ---------- Bước 4: Kiểm tra ELF ----------
 echo "=== Kiểm tra file ELF ==="
 for f in "$JNI_DIR"/*/*.so; do
     if [ -f "$f" ] && ! head -c4 "$f" | grep -q $'\x7fELF'; then
