@@ -119,16 +119,16 @@ jobs:
         working-directory: build_workspace
         run: flutter pub get
 
-      - name: Kiểm tra ABI filter & extractNativeLibs đã đúng
+      - name: Kiểm tra extractNativeLibs đã đúng
         working-directory: build_workspace
         run: |
-          grep -q "arm64-v8a" android/app/build.gradle
-          grep -q "armeabi-v7a" android/app/build.gradle
           grep -q 'extractNativeLibs="true"' android/app/src/main/AndroidManifest.xml
 
-      - name: Build APK release (split theo ABI)
+      - name: Build APK release (chỉ arm64 + arm32, split theo ABI)
         working-directory: build_workspace
-        run: flutter build apk --release --split-per-abi
+        run: |
+          flutter build apk --release --split-per-abi \
+            --target-platform android-arm,android-arm64
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
