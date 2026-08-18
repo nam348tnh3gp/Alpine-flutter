@@ -63,76 +63,116 @@ class PRootService {
     }
     await sink.close();
 
-    // 🔥 GIẢI NÉN BẰNG HOST TAR (Android có sẵn)
-    onLog('Giải nén bằng host tar...');
-    onProgress(0.87);
+    final busyboxSrc = '$libDir/libbusybox.so';
+    onLog('📦 Kiểm tra libbusybox.so tại: $busyboxSrc');
 
-    // Tìm đường dẫn tar trên Android
-    String? tarPath;
-    for (var p in ['/system/bin/tar', '/bin/tar', '/system/xbin/tar']) {
-      if (File(p).existsSync()) {
-        tarPath = p;
-        break;
+    if (!File(busyboxSrc).existsSync()) {
+      final altPaths = [
+        '$libDir/../libbusybox.so',
+        '/system/lib/libbusybox.so',
+        '/data/local/tmp/libbusybox.so',
+      ];
+      String? foundPath;
+      for (var p in altPaths) {
+        if (File(p).existsSync()) {
+          foundPath = p;
+          break;
+        }
+      }
+
+      if (foundPath != null) {
+        onLog('✅ Tìm thấy libbusybox.so tại: $foundPath');
+        await File(foundPath).copy(busyboxSrc);
+        await _chmodX(busyboxSrc);
+      } else {
+        throw Exception(
+          'Không tìm thấy libbusybox.so trong native libs ($busyboxSrc). '
+          'Kiểm tra bước "Tải native binaries" trong .github/workflows/build.yml '
+          'đã tải busybox-static thành công chưa.',
+        );
       }
     }
-    if (tarPath == null) {
-      throw Exception('Không tìm thấy tar trên hệ thống.');
+
+    // 🔥 Tạo symlink busybox để gọi applet
+    final busyboxBinDir = '$filesDir/busybox-bin';
+    await Directory(busyboxBinDir).create(recursive: true);
+    final busyboxLink = '$busyboxBinDir/busybox';
+    await Process.run('ln', ['-sf', busyboxSrc, busyboxLink]);
+
+    onLog('Giải nén rootfs...');
+    onProgress(0.87);
+
+    // Ưu tiên host tar nếu có
+    final hostTar = '/system/bin/tar';
+    String? tarCmd;
+    if (File(hostTar).existsSync()) {
+      tarCmd = hostTar;
+      onLog('Sử dụng host tar: $hostTar');
+    } else {
+      tarCmd = busyboxLink;
+      onLog('Sử dụng busybox tar');
     }
 
     final result = await Process.run(
-      tarPath,
+      tarCmd,
       ['-xzf', tarGzPath, '-C', rootfs],
+      environment: {
+        if (tarCmd == busyboxLink) 'LD_LIBRARY_PATH': libDir,
+        'PATH': '/bin:/system/bin:/system/xbin',
+      },
     );
 
     if (result.exitCode != 0) {
-      throw Exception(
-        'Giải nén rootfs thất bại: ${result.stderr}',
-      );
+      onLog('❌ Lỗi giải nén: exitCode=${result.exitCode}');
+      onLog('stderr: ${result.stderr}');
+      onLog('stdout: ${result.stdout}');
+
+      // Nếu host tar thất bại, thử lại với busybox
+      if (tarCmd == hostTar) {
+        onLog('🔄 Thử lại với busybox tar...');
+        final result2 = await Process.run(
+          busyboxLink,
+          ['-xzf', tarGzPath, '-C', rootfs],
+          environment: {
+            'LD_LIBRARY_PATH': libDir,
+            'PATH': '/bin:/system/bin:/system/xbin',
+          },
+        );
+        if (result2.exitCode != 0) {
+          throw Exception(
+            'Giải nén rootfs thất bại cả 2 cách: '
+            'host tar: ${result.stderr}, busybox: ${result2.stderr}',
+          );
+        }
+      } else {
+        throw Exception(
+          'Giải nén rootfs thất bại (busybox tar exit=${result.exitCode}): '
+          '${result.stderr}',
+        );
+      }
     }
 
     onProgress(0.95);
     await File(tarGzPath).delete().catchError((_) => File(tarGzPath));
 
-    // Tạo thư mục runtime
     for (final d in ['proc', 'sys', 'dev', 'tmp', 'root']) {
       Directory('$rootfs/$d').createSync(recursive: true);
     }
 
-    // DNS
     File('$rootfs/etc/resolv.conf')
         .writeAsStringSync('nameserver 8.8.8.8\nnameserver 1.1.1.1\n');
 
-    // 🔥 TẠO /bin/sh BẰNG CÁCH COPY BUSYBOX (KHÔNG DÙNG SYMLINK)
-    final busyboxSrc = '$libDir/libbusybox.so';
-    if (!File(busyboxSrc).existsSync()) {
-      throw Exception('Không tìm thấy libbusybox.so tại $busyboxSrc');
-    }
-
     final shPath = '$rootfs/bin/sh';
     if (!File(shPath).existsSync()) {
-      onLog('📦 Copy libbusybox.so thành /bin/sh...');
-      await File(busyboxSrc).copy(shPath);
-      await _chmodX(shPath);
-    } else {
-      // Kiểm tra xem file có thực sự là executable không
+      onLog('⚠️ /bin/sh không tồn tại! Tạo từ busybox...');
+      await File(busyboxSrc).copy('$rootfs/bin/busybox');
+      await _chmodX('$rootfs/bin/busybox');
       try {
-        final test = await Process.run(shPath, ['--version']);
-        if (test.exitCode != 0) {
-          onLog('⚠️ /bin/sh hiện có không chạy được, ghi đè bằng busybox...');
-          await File(busyboxSrc).copy(shPath);
-          await _chmodX(shPath);
-        }
-      } catch (_) {
+        await Process.run('ln', ['-sf', '/bin/busybox', shPath]);
+      } catch (e) {
         await File(busyboxSrc).copy(shPath);
         await _chmodX(shPath);
       }
-    }
-
-    // Đảm bảo busybox cũng có trong /bin (phòng khi cần)
-    final busyboxDst = '$rootfs/bin/busybox';
-    if (!File(busyboxDst).existsSync()) {
-      await File(busyboxSrc).copy(busyboxDst);
-      await _chmodX(busyboxDst);
     }
 
     onProgress(1.0);
@@ -142,10 +182,7 @@ class PRootService {
   Future<void> _chmodX(String path) async {
     try {
       await Process.run('chmod', ['+x', path]);
-    } catch (_) {
-      // fallback: dùng chmod shell
-      await Process.run('/system/bin/chmod', ['+x', path]);
-    }
+    } catch (_) {}
   }
 
   Future<Process> start({
