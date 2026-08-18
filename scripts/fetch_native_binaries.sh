@@ -46,9 +46,10 @@ fetch_proot() {
     local termux_arch="$1"
     local abi="${ARCH_MAP[$termux_arch]}"
     local target_file="$JNI_DIR/$abi/libproot.so"
+    local loader_check="$JNI_DIR/$abi/libproot-loader.so"
 
-    if [ -f "$target_file" ] && [ -s "$target_file" ]; then
-        echo "[proot/$termux_arch] Đã tồn tại, bỏ qua"
+    if [ -f "$target_file" ] && [ -s "$target_file" ] && [ -f "$loader_check" ] && [ -s "$loader_check" ]; then
+        echo "[proot/$termux_arch] Đã tồn tại (kèm loader), bỏ qua"
         return 0
     fi
 
@@ -77,6 +78,38 @@ fetch_proot() {
     chmod 755 "$target_file"
     patchelf --set-rpath '$ORIGIN' "$target_file" 2>/dev/null || true
     echo "OK: $target_file ($(du -h "$target_file" | cut -f1))"
+
+    # QUAN TRONG: proot ban Termux (patch rieng cho Android) KHONG execve()
+    # thang binary trong rootfs. No dung mot "loader" rieng (da nam san
+    # trong nativeLibraryDir, duoc phep exec) de TU MAP file ELF vao bo nho
+    # va nhay vao entry point - nho vay tranh duoc W^X SELinux chan execve()
+    # tren file nam trong thu muc rieng cua app (rootfs alpine cung nam
+    # trong /data/user/0/..., nen bat buoc phai co loader nay). Neu thieu,
+    # proot roi ve goi execve() thang -> dung chinh loi da gap:
+    #   "proot error: execve(...): Permission denied"
+    local loader_src="$extract_dir/data/data/com.termux/files/usr/libexec/proot/loader"
+    local loader32_src="$extract_dir/data/data/com.termux/files/usr/libexec/proot/loader32"
+    local loader_dst="$JNI_DIR/$abi/libproot-loader.so"
+    local loader32_dst="$JNI_DIR/$abi/libproot-loader32.so"
+
+    if [ -f "$loader_src" ]; then
+        cp -f "$loader_src" "$loader_dst"
+        chmod 755 "$loader_dst"
+        echo "OK: $loader_dst ($(du -h "$loader_dst" | cut -f1))"
+    else
+        echo "!! Không thấy loader tại $loader_src." >&2
+        return 1
+    fi
+
+    if [ -f "$loader32_src" ]; then
+        cp -f "$loader32_src" "$loader32_dst"
+        chmod 755 "$loader32_dst"
+        echo "OK: $loader32_dst ($(du -h "$loader32_dst" | cut -f1))"
+    else
+        # loader32 (loader cho tien trinh 32-bit) khong bat buoc tren thiet
+        # bi/rootfs thuan 64-bit, chi canh bao chu khong fail build.
+        echo "!! Không thấy loader32 tại $loader32_src (bỏ qua, chỉ cần cho ABI 32-bit)." >&2
+    fi
 }
 
 fetch_libtalloc() {
