@@ -48,10 +48,6 @@ class PRootService {
 
   Future<bool> isInstalled() async {
     final rootfs = await _rootfsDir();
-    // Không còn kiểm tra /bin/sh: chuyển sang gọi trực tiếp "busybox sh"
-    // (multi-call binary, không cần symlink riêng - xem hàm start()).
-    // Chỉ cần chắc chắn /bin/busybox (file thật, không phải symlink) tồn
-    // tại và có quyền exec là đủ để chạy được.
     final releaseOk = File('$rootfs/etc/alpine-release').existsSync();
     final busyboxOk = File('$rootfs/bin/busybox').existsSync();
     if (releaseOk && !busyboxOk) {
@@ -103,11 +99,6 @@ class PRootService {
     final tarStream = File(tarGzPath).openRead().transform(gzip.decoder);
     final reader = TarReader(tarStream);
 
-    // QUAN TRỌNG: phải xử lý riêng symlink. Alpine minirootfs có hàng chục
-    // symlink (mọi applet busybox: /bin/sh, /bin/ls, /bin/cat... đều trỏ
-    // tới /bin/busybox). package:tar cho biết chính xác entry nào là
-    // TypeFlag.symlink kèm linkName - khác với package:archive từng bị
-    // nhầm các symlink này thành thư mục rỗng.
     while (await reader.moveNext()) {
       final entry = reader.current;
       final header = entry.header;
@@ -132,7 +123,6 @@ class PRootService {
           dirCount++;
           break;
         default:
-          // Regular file (và các type ít gặp khác coi như file thường)
           final outFile = File(outPath);
           outFile.parent.createSync(recursive: true);
           await entry.contents.pipe(outFile.openWrite());
@@ -151,9 +141,6 @@ class PRootService {
     File('$rootfs/etc/resolv.conf')
         .writeAsStringSync('nameserver 8.8.8.8\nnameserver 1.1.1.1\n');
 
-    // Cấp lại quyền thực thi cho /bin/busybox - đây là file THẬT (không phải
-    // symlink), nên không có lý do gì nó thiếu ở bước này trừ khi tar.gz
-    // tải về bị hỏng/thiếu.
     final busyboxReal = '$rootfs/bin/busybox';
     if (File(busyboxReal).existsSync()) {
       await _chmodExecutable(busyboxReal);
@@ -162,11 +149,6 @@ class PRootService {
           'tar.gz tải về có thể bị hỏng/thiếu. Thử tải lại.');
     }
 
-    // Cố gắng tạo /bin/sh -> busybox cho TIỆN (một số script bên trong rootfs
-    // có shebang "#!/bin/sh"), nhưng KHÔNG bắt buộc: dù package:tar giờ đã
-    // tạo symlink đúng ngay từ bước giải nén ở trên, vẫn giữ bước dự phòng
-    // này; nếu vì lý do gì đó vẫn thất bại, start() bên dưới không phụ
-    // thuộc vào symlink này mà gọi thẳng "busybox sh".
     try {
       final shLink = Link('$rootfs/bin/sh');
       if (shLink.existsSync()) await shLink.delete();
@@ -198,51 +180,7 @@ class PRootService {
       throw Exception('Không tìm thấy libproot.so tại: $prootBin');
     }
 
-    final tmpDir = '$filesDir/proot-tmp';
-    if (await Directory(tmpDir).exists()) {
-      await Directory(tmpDir).delete(recursive: true);
-    }
-    Directory(tmpDir).createSync(recursive: true);
-
-    if (command.isEmpty) {
-      command = ['/bin/sh', '-l'];
-    }
-
-    // Không phụ thuộc symlink /bin/sh - dù package:tar giờ tạo symlink đúng,
-    // vẫn giữ đường an toàn này: gọi busybox multi-call binary trực tiếp
-    // ("busybox sh ...") hoạt động y hệt "sh ..." mà không cần symlink nào.
-    final effectiveCommand = List<String>.from(command);
-    if (effectiveCommand.isNotEmpty && effectiveCommand.first == '/bin/sh') {
-      effectiveCommand
-        ..removeAt(0)
-        ..insertAll(0, ['/bin/busybox', 'sh']);
-      _log('ℹ️ Đổi lệnh khởi chạy: /bin/sh -> /bin/busybox sh (không cần symlink)');
-    }
-
-    // Không còn cần bind /host-libs hay đường dẫn host nào vào argv: mọi
-    // path trong `command` đều là guest path (bên trong -r rootfs), proot
-    // tự dịch. libtalloc.so/libandroid-shmem.so được tìm qua rpath $ORIGIN
-    // (đã patch lúc build) + LD_LIBRARY_PATH trỏ thẳng nativeLibraryDir.
-    final args = <String>[
-      '-0',
-      '--link2symlink',
-      '--kill-on-exit',
-      '-r', rootfs,
-      '-b', '/dev',
-      '-b', '/proc',
-      '-b', '/sys',
-      '-b', '$tmpDir:/tmp',
-      '-w', '/root',
-      ...effectiveCommand,
-    ];
-
-    // QUAN TRONG (fix W^X "execve(...): Permission denied"): ban proot cua
-    // Termux cho Android khong execve() thang file trong rootfs. No dung
-    // mot "loader" rieng (nam trong nativeLibraryDir - noi DUY NHAT duoc
-    // Android cho phep exec bat chap SELinux W^X) de tu doc/anh xa ELF vao
-    // bo nho roi nhay vao entry point, thay vi goi execve() that su tren
-    // file nam trong /data/user/0/.../alpine-rootfs (bi chan). Neu khong
-    // khai bao PROOT_LOADER, proot roi ve execve() thang -> loi da gap.
+    // ---- Tạo symlink sạch cho loader trong filesDir (cách 2) ----
     final loaderPath = '$libDir/libproot-loader.so';
     final loader32Path = '$libDir/libproot-loader32.so';
     if (!File(loaderPath).existsSync()) {
@@ -253,9 +191,69 @@ class PRootService {
       );
     }
 
+    // Cấp quyền thực thi cho loader (dù đã có nhưng đảm bảo)
+    await _chmodExecutable(loaderPath);
+    if (File(loader32Path).existsSync()) {
+      await _chmodExecutable(loader32Path);
+    }
+
+    final loaderSymlink = '$filesDir/loader';
+    if (await File(loaderSymlink).exists()) {
+      await File(loaderSymlink).delete();
+    }
+    await Process.run('ln', ['-sf', loaderPath, loaderSymlink]);
+    _log('ℹ️ Tạo symlink loader: $loaderSymlink -> $loaderPath');
+
+    String? loader32Symlink;
+    if (File(loader32Path).existsSync()) {
+      loader32Symlink = '$filesDir/loader32';
+      if (await File(loader32Symlink).exists()) {
+        await File(loader32Symlink).delete();
+      }
+      await Process.run('ln', ['-sf', loader32Path, loader32Symlink]);
+      _log('ℹ️ Tạo symlink loader32: $loader32Symlink -> $loader32Path');
+    }
+
+    // ---- Xử lý tmpDir ----
+    final tmpDir = '$filesDir/proot-tmp';
+    if (await Directory(tmpDir).exists()) {
+      await Directory(tmpDir).delete(recursive: true);
+    }
+    Directory(tmpDir).createSync(recursive: true);
+
+    // ---- Xử lý command ----
+    if (command.isEmpty) {
+      command = ['/bin/sh', '-l'];
+    }
+    final effectiveCommand = List<String>.from(command);
+    if (effectiveCommand.isNotEmpty && effectiveCommand.first == '/bin/sh') {
+      effectiveCommand
+        ..removeAt(0)
+        ..insertAll(0, ['/bin/busybox', 'sh']);
+      _log('ℹ️ Đổi lệnh khởi chạy: /bin/sh -> /bin/busybox sh (không cần symlink)');
+    }
+
+    // ---- Xây dựng args (cách 1: thêm --loader) ----
+    final args = <String>[
+      '-0',
+      '--link2symlink',
+      '--kill-on-exit',
+      '--loader', loaderSymlink,          // <-- Thêm flag loader (cách 1)
+      if (loader32Symlink != null) ...['--loader32', loader32Symlink],
+      '-r', rootfs,
+      '-b', '/dev',
+      '-b', '/proc',
+      '-b', '/sys',
+      '-b', '$tmpDir:/tmp',
+      '-w', '/root',
+      ...effectiveCommand,
+    ];
+
+    // ---- Môi trường ----
     final env = <String, String>{
       'PROOT_TMP_DIR': tmpDir,
-      'PROOT_LOADER': loaderPath,
+      'PROOT_LOADER': loaderSymlink,      // Vẫn giữ để an toàn
+      if (loader32Symlink != null) 'PROOT_LOADER_32': loader32Symlink,
       'LD_LIBRARY_PATH': libDir,
       'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
       'HOME': '/root',
@@ -263,12 +261,9 @@ class PRootService {
       'COLUMNS': '80',
       'LINES': '24',
     };
-    if (File(loader32Path).existsSync()) {
-      env['PROOT_LOADER_32'] = loader32Path;
-    }
 
     _log('🚀 Khởi chạy: $prootBin ${args.join(' ')}');
-    _log('   PROOT_LOADER=$loaderPath');
+    _log('   Loader: $loaderSymlink');
 
     final process = await Process.start(
       prootBin,
