@@ -198,15 +198,16 @@ class PRootService {
     if (command.isEmpty) command = ['/bin/sh', '-l'];
     final effectiveCommand = List<String>.from(command);
     if (effectiveCommand.isNotEmpty && effectiveCommand.first == '/bin/sh') {
+      // Dùng đường dẫn guest (sẽ được bind mount)
       effectiveCommand
         ..removeAt(0)
-        ..insertAll(0, [busyboxCopy, 'sh']);   // Dùng busybox copy
-      _log('ℹ️ Dùng busybox từ host: $busyboxCopy');
+        ..insertAll(0, ['/host-files/busybox', 'sh']);
+      _log('ℹ️ Dùng busybox từ guest bind: /host-files/busybox');
     }
 
-    // ---- Args với -v 5 để debug ----
+    // ---- Args với -v 5 để debug và bind mount filesDir vào guest ----
     final args = <String>[
-      '-v', '5',        // verbose để xem loader có được dùng không
+      '-v', '5',
       '-0',
       '--link2symlink',
       '--kill-on-exit',
@@ -215,6 +216,7 @@ class PRootService {
       '-b', '/proc',
       '-b', '/sys',
       '-b', '$tmpDir:/tmp',
+      '-b', '$filesDir:/host-files',   // Bind mount filesDir vào guest
       '-w', '/root',
       ...effectiveCommand,
     ];
@@ -222,7 +224,7 @@ class PRootService {
     // ---- Môi trường ----
     final env = <String, String>{
       'PROOT_TMP_DIR': tmpDir,
-      'PROOT_LOADER': loaderCopy,          // Trỏ đến bản copy
+      'PROOT_LOADER': loaderCopy,          // Loader vẫn dùng từ host
       if (loader32Copy != null) 'PROOT_LOADER_32': loader32Copy,
       'LD_LIBRARY_PATH': libDir,
       'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
