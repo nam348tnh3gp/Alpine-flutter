@@ -21,24 +21,13 @@ android {
     defaultConfig {
         applicationId = "com.example.alpinerunner"
         minSdk = 26
-        targetSdk = flutter.targetSdkVersion
-        // KHÔNG dùng flutter.versionCode / flutter.versionName: property này
-        // được thêm/đổi cách expose (property vs method) qua lại giữa các
-        // bản Flutter Gradle Plugin gần đây và gây lỗi "unknown property"
-        // tuỳ đúng version pin. App nội bộ nên hardcode thẳng cho chắc.
+        // 🔥 QUAN TRỌNG: hạ targetSdk về 28 để tắt W^X
+        targetSdk = 28
         versionCode = 1
         versionName = "1.0.0"
-
-        // KHÔNG khai ndk.abiFilters ở đây: khi build bằng `--split-per-abi`,
-        // Flutter Gradle Plugin tự cấu hình khối android.splits.abi, và nó
-        // xung đột (Gradle lỗi "Conflicting configuration") nếu abiFilters
-        // cũng được set thủ công. Việc giới hạn chỉ còn arm64-v8a +
-        // armeabi-v7a (bỏ x86_64) được làm qua cờ --target-platform khi
-        // gọi `flutter build apk`, xem .github/workflows/build.yml.
     }
 
-    // QUAN TRỌNG cho việc "lách" W^X: ép extract lib*.so ra nativeLibraryDir
-    // thay vì chạy thẳng từ APK nén.
+    // Ép extract lib*.so ra nativeLibraryDir
     packagingOptions {
         jniLibs {
             useLegacyPackaging = true
