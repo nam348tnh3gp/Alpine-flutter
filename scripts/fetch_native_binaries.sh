@@ -119,6 +119,43 @@ fetch_libtalloc() {
     echo "OK: $target_file ($(du -h "$target_file" | cut -f1))"
 }
 
+fetch_libandroid_shmem() {
+    local termux_arch="$1"
+    local abi="${ARCH_MAP[$termux_arch]}"
+    local target_file="$JNI_DIR/$abi/libandroid-shmem.so"
+
+    if [ -f "$target_file" ] && [ -s "$target_file" ]; then
+        echo "[libandroid-shmem/$termux_arch] Đã tồn tại, bỏ qua"
+        return 0
+    fi
+
+    local filename
+    filename="$(termux_deb_url "$termux_arch" "libandroid-shmem")"
+    if [ -z "$filename" ]; then
+        echo "!! Không tìm thấy libandroid-shmem cho arch '$termux_arch'." >&2
+        return 1
+    fi
+
+    local deb_url="https://packages.termux.dev/apt/termux-main/${filename}"
+    local deb_path="$WORK_DIR/libandroid-shmem-${termux_arch}.deb"
+    echo "[libandroid-shmem/$termux_arch] Tải từ $deb_url"
+    curl -fsSL "$deb_url" -o "$deb_path"
+
+    local extract_dir="$WORK_DIR/libandroid-shmem-${termux_arch}-extracted"
+    termux_extract_deb "$deb_path" "$extract_dir"
+
+    local src
+    src="$(find "$extract_dir/data/data/com.termux/files/usr/lib" -name 'libandroid-shmem.so*' -type f | head -n1)"
+    if [ -z "$src" ] || [ ! -f "$src" ]; then
+        echo "!! Không tìm thấy libandroid-shmem.so* trong gói." >&2
+        return 1
+    fi
+
+    cp -f "$src" "$target_file"
+    chmod 755 "$target_file"
+    echo "OK: $target_file ($(du -h "$target_file" | cut -f1))"
+}
+
 fetch_busybox_alpine() {
     local termux_arch="$1"
     local abi="${ARCH_MAP[$termux_arch]}"
@@ -168,6 +205,11 @@ fetch_busybox_alpine() {
 echo "=== Tải proot từ Termux ==="
 for termux_arch in aarch64 arm; do
     fetch_proot "$termux_arch" || exit 1
+done
+
+echo "=== Tải libandroid-shmem từ Termux ==="
+for termux_arch in aarch64 arm; do
+    fetch_libandroid_shmem "$termux_arch" || exit 1
 done
 
 echo "=== Tải libtalloc từ Termux ==="
