@@ -3,7 +3,6 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'native_bridge.dart';
-import 'package:flutter/services.dart'; // Thêm để copy
 
 class PRootService {
   static const _alpineVersion = '3.19.9';
@@ -16,11 +15,22 @@ class PRootService {
   final void Function(String line) onLog;
   Process? _currentProcess;
   
-  // 🔥 Thêm buffer để lưu log
-  StringBuffer _logBuffer = StringBuffer();
-  bool _logEnabled = true;
+  // 🔥 Buffer để lưu log
+  final StringBuffer _logBuffer = StringBuffer();
 
   PRootService({required this.onLog});
+
+  // 🔥 Lấy toàn bộ log
+  String getLogs() => _logBuffer.toString();
+  
+  // 🔥 Xóa log
+  void clearLogs() => _logBuffer.clear();
+
+  // 🔥 Log có buffer
+  void _log(String message) {
+    _logBuffer.writeln(message);
+    onLog(message);
+  }
 
   Future<String> _rootfsDir() async {
     final filesDir = await NativeBridge.getFilesDir();
@@ -47,7 +57,7 @@ class PRootService {
     final url = 'https://dl-cdn.alpinelinux.org/alpine/v${_alpineVersion.substring(0, 4)}/'
         'releases/$alpineArch/alpine-minirootfs-$_alpineVersion-$alpineArch.tar.gz';
 
-    _log('Đang tải Alpine minirootfs ($alpineArch)...\n$url');
+    _log('📥 Đang tải Alpine minirootfs ($alpineArch)...\n$url');
 
     final tarGzPath = '$filesDir/alpine-rootfs.tar.gz';
     final request = http.Request('GET', Uri.parse(url));
@@ -98,7 +108,7 @@ class PRootService {
       }
     }
 
-    // 🔥 CÁCH 2: Tạo symlink để gọi busybox đúng cách
+    // Tạo symlink để gọi busybox đúng cách
     final tempBinDir = Directory('$filesDir/busybox-bin');
     if (await tempBinDir.exists()) {
       await tempBinDir.delete(recursive: true);
@@ -109,8 +119,7 @@ class PRootService {
     await Process.run('ln', ['-sf', busyboxSrc, tarLink.path]);
 
     _log('✅ Đã tạo symlink tar -> busybox');
-
-    _log('Giải nén rootfs bằng busybox tar (qua symlink)...');
+    _log('📦 Giải nén rootfs...');
     onProgress(0.87);
 
     final result = await Process.run(
@@ -125,7 +134,6 @@ class PRootService {
     if (result.exitCode != 0) {
       _log('❌ Lỗi giải nén: exitCode=${result.exitCode}');
       _log('stderr: ${result.stderr}');
-      _log('stdout: ${result.stdout}');
 
       final hostTar = '/system/bin/tar';
       if (File(hostTar).existsSync()) {
@@ -140,7 +148,6 @@ class PRootService {
             'busybox: ${result.stderr}, host tar: ${result2.stderr}',
           );
         }
-        await File('$rootfs/usr').delete(recursive: true).catchError((_) {});
       } else {
         throw Exception(
           'Giải nén rootfs thất bại (busybox tar exit=${result.exitCode}): '
@@ -166,7 +173,7 @@ class PRootService {
       _log('⚠️ /bin/sh không tồn tại! Tạo từ busybox...');
       await File(busyboxSrc).copy('$rootfs/bin/busybox');
       await _chmodX('$rootfs/bin/busybox');
-      
+
       try {
         await Process.run('ln', ['-sf', '/bin/busybox', shPath]);
         _log('✅ Đã tạo symlink /bin/sh -> busybox');
@@ -175,18 +182,12 @@ class PRootService {
         await File(busyboxSrc).copy(shPath);
         await _chmodX(shPath);
       }
-    } else {
-      _log('✅ /bin/sh đã tồn tại');
     }
 
     if (File('$rootfs/bin/sh').existsSync()) {
       _log('✅ Shell đã sẵn sàng!');
     } else {
-      _log('❌ VẪN CHƯA CÓ /bin/sh! Kiểm tra lại.');
-      try {
-        final lsResult = await Process.run('ls', ['-la', '$rootfs/bin']);
-        _log('Nội dung /bin:\n${lsResult.stdout}');
-      } catch (_) {}
+      _log('❌ VẪN CHƯA CÓ /bin/sh!');
     }
 
     onProgress(1.0);
@@ -201,25 +202,12 @@ class PRootService {
     }
   }
 
-  // 🔥 HÀM LOG với buffer để copy
-  void _log(String message) {
-    _logBuffer.writeln(message);
-    onLog(message);
-  }
-
-  // 🔥 Lấy toàn bộ log để copy
-  String getLogs() {
-    return _logBuffer.toString();
-  }
-
-  // 🔥 Xóa log
-  void clearLogs() {
-    _logBuffer.clear();
-  }
-
-  // 🔥 Bật/tắt log
-  void setLogEnabled(bool enabled) {
-    _logEnabled = enabled;
+  // 🔥 RESIZE TERMINAL
+  void resizeTerminal(int columns, int lines) {
+    if (_currentProcess != null) {
+      _currentProcess!.kill(ProcessSignal.sigwinch);
+      _log('📐 Terminal resized to ${columns}x${lines}');
+    }
   }
 
   Future<Process> start({
@@ -257,7 +245,7 @@ class PRootService {
       } else {
         throw Exception(
           'Không tìm thấy shell: $shPath. '
-          'Kiểm tra quá trình cài đặt rootfs.'
+          'Kiểm tra quá trình cài đặt rootfs.',
         );
       }
     }
@@ -287,7 +275,6 @@ class PRootService {
         'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/host-libs',
         'HOME': '/root',
         'TERM': 'xterm-256color',
-        // 🔥 Resize terminal cho giống Termux
         'COLUMNS': '80',
         'LINES': '24',
       },
@@ -297,11 +284,9 @@ class PRootService {
     _currentProcess = process;
     process.stdout.transform(utf8.decoder).listen((s) {
       onStdout?.call(s);
-      print('STDOUT: $s');
     });
     process.stderr.transform(utf8.decoder).listen((s) {
       onStderr?.call(s);
-      print('STDERR: $s');
     });
 
     process.exitCode.then((code) {
@@ -309,15 +294,6 @@ class PRootService {
     });
 
     return process;
-  }
-
-  // 🔥 HÀM RESIZE TERMINAL (gọi từ UI khi kích thước thay đổi)
-  void resizeTerminal(int columns, int lines) {
-    if (_currentProcess != null) {
-      // Gửi tín hiệu SIGWINCH để process biết terminal đã resize
-      _currentProcess!.kill(ProcessSignal.sigwinch);
-      _log('📐 Terminal resized to ${columns}x${lines}');
-    }
   }
 
   void stop() {
