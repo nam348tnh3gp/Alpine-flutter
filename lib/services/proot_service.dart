@@ -63,12 +63,10 @@ class PRootService {
     }
     await sink.close();
 
-    // 🔥 KIỂM TRA libbusybox.so TỒN TẠI
     final busyboxSrc = '$libDir/libbusybox.so';
     onLog('📦 Kiểm tra libbusybox.so tại: $busyboxSrc');
-    
+
     if (!File(busyboxSrc).existsSync()) {
-      // Thử tìm trong thư mục khác
       final altPaths = [
         '$libDir/../libbusybox.so',
         '/system/lib/libbusybox.so',
@@ -81,12 +79,11 @@ class PRootService {
           break;
         }
       }
-      
+
       if (foundPath != null) {
         onLog('✅ Tìm thấy libbusybox.so tại: $foundPath');
-        // Copy vào libDir nếu cần
         await File(foundPath).copy(busyboxSrc);
-        await File(busyboxSrc).setMode(FileMode.ownerExecute);
+        await _chmodX(busyboxSrc);
       } else {
         throw Exception(
           'Không tìm thấy libbusybox.so trong native libs ($busyboxSrc). '
@@ -96,10 +93,9 @@ class PRootService {
       }
     }
 
-    // 🔥 SET LD_LIBRARY_PATH CHO busybox
     onLog('Giải nén rootfs bằng busybox tar (giữ đúng symlink)...');
     onProgress(0.87);
-    
+
     final result = await Process.run(
       busyboxSrc,
       [
@@ -110,17 +106,16 @@ class PRootService {
         rootfs,
       ],
       environment: {
-        'LD_LIBRARY_PATH': libDir,  // 🔥 QUAN TRỌNG: set LD_LIBRARY_PATH
+        'LD_LIBRARY_PATH': libDir,
         'PATH': '/bin:/system/bin:/system/xbin',
       },
     );
-    
+
     if (result.exitCode != 0) {
       onLog('❌ Lỗi giải nén: exitCode=${result.exitCode}');
       onLog('stderr: ${result.stderr}');
       onLog('stdout: ${result.stdout}');
-      
-      // 🔥 THỬ CÁCH 2: DÙNG tar CỦA HOST (nếu có)
+
       onLog('🔄 Thử giải nén bằng tar host...');
       final hostTar = '/system/bin/tar';
       if (File(hostTar).existsSync()) {
@@ -141,37 +136,42 @@ class PRootService {
         );
       }
     }
-    
+
     onProgress(0.95);
     await File(tarGzPath).delete().catchError((_) => File(tarGzPath));
 
-    // Tạo thư mục runtime
     for (final d in ['proc', 'sys', 'dev', 'tmp', 'root']) {
       Directory('$rootfs/$d').createSync(recursive: true);
     }
 
-    // DNS
     File('$rootfs/etc/resolv.conf')
         .writeAsStringSync('nameserver 8.8.8.8\nnameserver 1.1.1.1\n');
 
-    // 🔥 KIỂM TRA /bin/sh
     final shPath = '$rootfs/bin/sh';
     if (!File(shPath).existsSync()) {
       onLog('⚠️ /bin/sh không tồn tại! Tạo từ busybox...');
-      // Copy busybox vào rootfs nếu cần
       await File(busyboxSrc).copy('$rootfs/bin/busybox');
-      await File('$rootfs/bin/busybox').setMode(FileMode.ownerExecute);
-      // Tạo symlink
+      await _chmodX('$rootfs/bin/busybox');
       try {
         await Process.run('ln', ['-sf', '/bin/busybox', shPath]);
       } catch (e) {
         await File(busyboxSrc).copy(shPath);
-        await File(shPath).setMode(FileMode.ownerExecute);
+        await _chmodX(shPath);
       }
     }
 
     onProgress(1.0);
     onLog('✅ Hoàn tất cài đặt Alpine rootfs tại: $rootfs');
+  }
+
+  // Hàm tiện ích cấp quyền thực thi
+  Future<void> _chmodX(String path) async {
+    try {
+      await Process.run('chmod', ['+x', path]);
+    } catch (_) {
+      // fallback: dùng Dart 3.3+ nếu có
+      // File(path).chmod(FileMode.ownerExecute); // không dùng vì có thể lỗi
+    }
   }
 
   Future<Process> start({
@@ -200,7 +200,7 @@ class PRootService {
       '-b', '/proc',
       '-b', '/sys',
       '-b', '$tmpDir:/tmp',
-      '-b', '$libDir:/host-libs', // Mount libDir để có thư viện
+      '-b', '$libDir:/host-libs',
       '-w', '/root',
       ...command,
     ];
