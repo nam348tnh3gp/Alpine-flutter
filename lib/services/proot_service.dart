@@ -156,27 +156,13 @@ class PRootService {
       throw Exception('Không tìm thấy libproot.so tại: $prootBin');
     }
 
-    // ---- Copy loader vào filesDir để đảm bảo đường dẫn sạch và quyền exec ----
-    final loaderSource = '$libDir/libproot-loader.so';
-    final loaderCopy = '$filesDir/loader';
-    if (!File(loaderSource).existsSync()) {
-      throw Exception('Không tìm thấy loader tại $loaderSource.');
+    // ---- Sử dụng loader trực tiếp từ nativeLibraryDir ----
+    final loaderPath = '$libDir/libproot-loader.so';
+    if (!File(loaderPath).existsSync()) {
+      throw Exception('Không tìm thấy loader tại $loaderPath.');
     }
-    if (await File(loaderCopy).exists()) await File(loaderCopy).delete();
-    await File(loaderSource).copy(loaderCopy);
-    await Process.run('chmod', ['755', loaderCopy]);
-    _log('✅ Loader ready: $loaderCopy');
-
-    // ---- loader32 (optional) ----
-    final loader32Source = '$libDir/libproot-loader32.so';
-    String? loader32Copy;
-    if (File(loader32Source).existsSync()) {
-      loader32Copy = '$filesDir/loader32';
-      if (await File(loader32Copy).exists()) await File(loader32Copy).delete();
-      await File(loader32Source).copy(loader32Copy);
-      await Process.run('chmod', ['755', loader32Copy]);
-      _log('✅ Loader32 ready: $loader32Copy');
-    }
+    // loader32 (optional)
+    final loader32Path = '$libDir/libproot-loader32.so';
 
     // ---- tmpDir ----
     final tmpDir = '$filesDir/proot-tmp';
@@ -195,7 +181,7 @@ class PRootService {
       _log('ℹ️ Dùng busybox trong rootfs: /bin/busybox sh');
     }
 
-    // ---- Args (không bind mount libDir) ----
+    // ---- Args ----
     final args = <String>[
       '-v', '5',
       '-0',
@@ -213,8 +199,8 @@ class PRootService {
     // ---- Môi trường ----
     final env = <String, String>{
       'PROOT_TMP_DIR': tmpDir,
-      'PROOT_LOADER': loaderCopy,
-      if (loader32Copy != null) 'PROOT_LOADER_32': loader32Copy,
+      'PROOT_LOADER': loaderPath,
+      if (File(loader32Path).existsSync()) 'PROOT_LOADER_32': loader32Path,
       'LD_LIBRARY_PATH': libDir,
       'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
       'HOME': '/root',
@@ -224,7 +210,7 @@ class PRootService {
     };
 
     _log('🚀 Khởi chạy: $prootBin ${args.join(' ')}');
-    _log('   PROOT_LOADER=$loaderCopy');
+    _log('   PROOT_LOADER=$loaderPath');
 
     final process = await Process.start(
       prootBin,
