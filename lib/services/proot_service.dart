@@ -1,9 +1,16 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:archive/archive_io.dart';
 import 'package:http/http.dart' as http;
 import 'native_bridge.dart';
 
+/// Quản lý bootstrap Alpine rootfs + chạy proot. KHÔNG exec bất kỳ native
+/// binary nào (tar/busybox...) trực tiếp trên host để giải nén - Android áp
+/// seccomp-bpf cho tiến trình app, nhiều syscall mà tar/musl dùng bị chặn,
+/// gây crash SIGSYS (exitCode âm, vd -31) ngay cả khi binary hợp lệ và có
+/// quyền exec. Giải nén bằng package:archive thuần Dart (không qua syscall
+/// lạ nào ngoài file I/O thông thường mà Flutter vẫn dùng hằng ngày).
 class PRootService {
   static const _alpineVersion = '3.19.9';
 
@@ -31,24 +38,26 @@ class PRootService {
     return '$filesDir/alpine-rootfs';
   }
 
-  Future<bool> isInstalled() async {
-    final rootfs = await _rootfsDir();
-    return File('$rootfs/etc/alpine-release').existsSync();
+  Future<void> _chmodExecutable(String path) async {
+    final result = await Process.run('chmod', ['755', path]);
+    if (result.exitCode != 0) {
+      throw Exception('chmod thất bại cho $path: ${result.stderr}');
+    }
   }
 
-  // 🔥 Tạo symlink cho busybox applet
-  Future<String> _createBusyboxSymlink(String applet, String libDir) async {
-    final filesDir = await NativeBridge.getFilesDir();
-    final symlinkDir = '$filesDir/busybox-links';
-    await Directory(symlinkDir).create(recursive: true);
-    final linkPath = '$symlinkDir/$applet';
-    
-    final busyboxPath = '$libDir/libbusybox.so';
-    if (!File(linkPath).existsSync()) {
-      await Process.run('ln', ['-sf', busyboxPath, linkPath]);
-      _log('✅ Đã tạo symlink: $applet -> libbusybox.so');
+  Future<bool> isInstalled() async {
+    final rootfs = await _rootfsDir();
+    // Kiểm tra CẢ HAI: alpine-release (rootfs đã giải nén) VÀ /bin/sh thực
+    // sự resolve được (không phải symlink gãy). Nếu lần trước bootstrap bị
+    // crash giữa chừng, alpine-release có thể đã tồn tại nhưng /bin/sh thì
+    // chưa -> phải coi là CHƯA cài để tự động cài lại từ đầu.
+    final releaseOk = File('$rootfs/etc/alpine-release').existsSync();
+    final shOk = File('$rootfs/bin/sh').existsSync(); // existsSync() trên
+    // File sẽ follow symlink và trả về false nếu target không tồn tại/gãy.
+    if (releaseOk && !shOk) {
+      _log('⚠️ Phát hiện rootfs cài dở từ lần trước (thiếu /bin/sh khả dụng) - sẽ cài lại.');
     }
-    return linkPath;
+    return releaseOk && shOk;
   }
 
   Future<void> bootstrap({required void Function(double) onProgress}) async {
@@ -56,7 +65,6 @@ class PRootService {
     final alpineArch = _alpineArchMap[abi] ?? 'aarch64';
     final rootfs = await _rootfsDir();
     final filesDir = await NativeBridge.getFilesDir();
-    final libDir = await NativeBridge.getNativeLibraryDir();
 
     if (await Directory(rootfs).exists()) {
       await Directory(rootfs).delete(recursive: true);
@@ -82,74 +90,72 @@ class PRootService {
     await for (final chunk in response.stream) {
       sink.add(chunk);
       received += chunk.length;
-      if (total > 0) onProgress(received / total * 0.85);
+      if (total > 0) onProgress(received / total * 0.7);
     }
     await sink.close();
 
-    // 🔥 Tạo symlink tar -> libbusybox.so
-    final tarLink = await _createBusyboxSymlink('tar', libDir);
-    _log('📦 Giải nén rootfs bằng busybox tar...');
-    onProgress(0.87);
+    _log('📦 Giải nén rootfs (Dart thuần, không exec native binary)...');
+    onProgress(0.72);
 
-    final result = await Process.run(
-      tarLink,
-      ['xzf', tarGzPath, '-C', rootfs],
-      environment: {
-        'PATH': '/bin:/system/bin:/system/xbin',
-      },
-    );
+    final bytes = File(tarGzPath).readAsBytesSync();
+    final archive = TarDecoder().decodeBytes(GZipDecoder().decodeBytes(bytes));
 
-    if (result.exitCode != 0) {
-      _log('❌ Lỗi giải nén: exitCode=${result.exitCode}');
-      _log('stderr: ${result.stderr}');
+    // QUAN TRỌNG: phải xử lý riêng symlink. Alpine minirootfs có hàng chục
+    // symlink (mọi applet busybox: /bin/sh, /bin/ls, /bin/cat... đều trỏ
+    // tới /bin/busybox). Nếu coi mọi entry không phải file là "thư mục",
+    // toàn bộ các symlink này biến thành thư mục rỗng sai, /bin/sh sẽ
+    // KHÔNG tồn tại dù rootfs "giải nén thành công".
+    var fileCount = 0, dirCount = 0, linkCount = 0;
+    for (final entry in archive) {
+      final outPath = '$rootfs/${entry.name}';
 
-      final hostTar = '/system/bin/tar';
-      if (File(hostTar).existsSync()) {
-        _log('🔄 Thử giải nén bằng host tar...');
-        final result2 = await Process.run(
-          hostTar,
-          ['-xzf', tarGzPath, '-C', rootfs],
-        );
-        if (result2.exitCode != 0) {
-          throw Exception('Giải nén thất bại: ${result2.stderr}');
+      if (entry.isSymbolicLink) {
+        final target = entry.nameOfLinkedFile;
+        final linkFile = Link(outPath);
+        Directory(linkFile.path).parent.createSync(recursive: true);
+        if (linkFile.existsSync()) {
+          linkFile.deleteSync();
+        } else if (File(outPath).existsSync()) {
+          File(outPath).deleteSync();
         }
+        linkFile.createSync(target, recursive: true);
+        linkCount++;
+      } else if (entry.isFile) {
+        final outFile = File(outPath);
+        outFile.parent.createSync(recursive: true);
+        outFile.writeAsBytesSync(entry.content as List<int>);
+        fileCount++;
       } else {
-        throw Exception('Giải nén rootfs thất bại: ${result.stderr}');
+        Directory(outPath).createSync(recursive: true);
+        dirCount++;
       }
     }
+    _log('   -> $fileCount file, $dirCount thư mục, $linkCount symlink');
+    onProgress(0.92);
 
-    onProgress(0.95);
-    await File(tarGzPath).delete().catchError((_) {});
+    await File(tarGzPath).delete().catchError((_) => File(tarGzPath));
 
     for (final d in ['proc', 'sys', 'dev', 'tmp', 'root']) {
       Directory('$rootfs/$d').createSync(recursive: true);
     }
-
     File('$rootfs/etc/resolv.conf')
         .writeAsStringSync('nameserver 8.8.8.8\nnameserver 1.1.1.1\n');
 
-    // 🔥 Tạo /bin/sh nếu chưa có
-    final shPath = '$rootfs/bin/sh';
-    if (!File(shPath).existsSync()) {
-      _log('⚠️ /bin/sh không tồn tại! Tạo từ busybox...');
-      final busyboxPath = '$libDir/libbusybox.so';
-      await File(busyboxPath).copy('$rootfs/bin/busybox');
-      await Process.run('chmod', ['+x', '$rootfs/bin/busybox']);
-      
-      try {
-        await Process.run('ln', ['-sf', '/bin/busybox', shPath]);
-        _log('✅ Đã tạo symlink /bin/sh -> busybox');
-      } catch (e) {
-        _log('⚠️ Copy busybox thành sh');
-        await File(busyboxPath).copy(shPath);
-        await Process.run('chmod', ['+x', shPath]);
-      }
+    // Cấp lại quyền thực thi cho các binary quan trọng - archive package giữ
+    // nguyên file mode từ tar header trong đa số trường hợp, nhưng chmod lại
+    // /bin/busybox cho chắc chắn (phòng khi mode bị mất khi ghi qua Dart IO).
+    final busyboxReal = '$rootfs/bin/busybox';
+    if (File(busyboxReal).existsSync()) {
+      await _chmodExecutable(busyboxReal);
     }
 
-    if (File(shPath).existsSync()) {
-      _log('✅ Shell đã sẵn sàng!');
+    final shOk = File('$rootfs/bin/sh').existsSync();
+    if (shOk) {
+      _log('✅ Shell /bin/sh đã sẵn sàng (symlink -> busybox).');
     } else {
-      _log('❌ VẪN CHƯA CÓ /bin/sh!');
+      _log('❌ VẪN CHƯA CÓ /bin/sh sau khi giải nén đúng cách - kiểm tra lại '
+          'file tar.gz tải về có bị hỏng/thiếu không.');
+      throw Exception('/bin/sh không tồn tại sau khi bootstrap.');
     }
 
     onProgress(1.0);
@@ -166,7 +172,6 @@ class PRootService {
     final filesDir = await NativeBridge.getFilesDir();
 
     final prootBin = '$libDir/libproot.so';
-
     if (!File(prootBin).existsSync()) {
       throw Exception('Không tìm thấy libproot.so tại: $prootBin');
     }
@@ -177,20 +182,14 @@ class PRootService {
     }
     Directory(tmpDir).createSync(recursive: true);
 
-    // 🔥 Tạo symlink sh -> libbusybox.so nếu cần
-    final shLink = await _createBusyboxSymlink('sh', libDir);
-
-    // Nếu command là /bin/sh và không tồn tại, dùng symlink
-    if (command.isEmpty || command[0] == '/bin/sh') {
-      final shPath = '$rootfs/bin/sh';
-      if (!File(shPath).existsSync()) {
-        _log('⚠️ /bin/sh không tồn tại! Dùng busybox symlink');
-        command = [shLink, '-l'];
-      } else {
-        command = ['/bin/sh', '-l'];
-      }
+    if (command.isEmpty) {
+      command = ['/bin/sh', '-l'];
     }
 
+    // Không còn cần bind /host-libs hay đường dẫn host nào vào argv: mọi
+    // path trong `command` đều là guest path (bên trong -r rootfs), proot
+    // tự dịch. libtalloc.so/libandroid-shmem.so được tìm qua rpath $ORIGIN
+    // (đã patch lúc build) + LD_LIBRARY_PATH trỏ thẳng nativeLibraryDir.
     final args = <String>[
       '-0',
       '--link2symlink',
@@ -200,7 +199,6 @@ class PRootService {
       '-b', '/proc',
       '-b', '/sys',
       '-b', '$tmpDir:/tmp',
-      '-b', '$libDir:/host-libs',
       '-w', '/root',
       ...command,
     ];
@@ -212,8 +210,8 @@ class PRootService {
       args,
       environment: {
         'PROOT_TMP_DIR': tmpDir,
-        'LD_LIBRARY_PATH': '/host-libs',
-        'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/host-libs',
+        'LD_LIBRARY_PATH': libDir,
+        'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
         'HOME': '/root',
         'TERM': 'xterm-256color',
         'COLUMNS': '80',
@@ -223,16 +221,9 @@ class PRootService {
     );
 
     _currentProcess = process;
-    process.stdout.transform(utf8.decoder).listen((s) {
-      onStdout?.call(s);
-    });
-    process.stderr.transform(utf8.decoder).listen((s) {
-      onStderr?.call(s);
-    });
-
-    process.exitCode.then((code) {
-      _log('Process exited with code $code');
-    });
+    process.stdout.transform(utf8.decoder).listen((s) => onStdout?.call(s));
+    process.stderr.transform(utf8.decoder).listen((s) => onStderr?.call(s));
+    process.exitCode.then((code) => _log('Process exited with code $code'));
 
     return process;
   }
