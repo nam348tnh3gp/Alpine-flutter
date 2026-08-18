@@ -7,7 +7,6 @@ import 'native_bridge.dart';
 
 class PRootService {
   static const _alpineVersion = '3.19.9';
-
   static const _alpineArchMap = {
     'arm64-v8a': 'aarch64',
     'armeabi-v7a': 'armv7',
@@ -76,9 +75,7 @@ class PRootService {
     }
     await sink.close();
 
-    _log('📦 Giải nén rootfs bằng package:tar (hỗ trợ symlink đầy đủ, không '
-        'phụ thuộc archive package - biết có bug thiếu symlink cho định dạng '
-        'TAR)...');
+    _log('📦 Giải nén rootfs bằng package:tar (hỗ trợ symlink đầy đủ)...');
     onProgress(0.72);
 
     var fileCount = 0, dirCount = 0, linkCount = 0;
@@ -96,11 +93,8 @@ class PRootService {
           if (target == null) break;
           Directory(outPath).parent.createSync(recursive: true);
           final linkFile = Link(outPath);
-          if (linkFile.existsSync()) {
-            await linkFile.delete();
-          } else if (File(outPath).existsSync()) {
-            File(outPath).deleteSync();
-          }
+          if (linkFile.existsSync()) await linkFile.delete();
+          else if (File(outPath).existsSync()) File(outPath).deleteSync();
           await linkFile.create(target, recursive: true);
           linkCount++;
           break;
@@ -129,25 +123,20 @@ class PRootService {
 
     final busyboxReal = '$rootfs/bin/busybox';
     if (File(busyboxReal).existsSync()) {
-      // Không cần chmod vì file này nằm trong rootfs (thuộc filesDir) - nên có thể chmod
-      // Nhưng tốt nhất là không cần vì tar đã giữ quyền, nhưng để chắc chắn vẫn làm
+      // Cấp quyền cho busybox trong rootfs (thuộc filesDir, được phép)
       await Process.run('chmod', ['755', busyboxReal]);
     } else {
-      throw Exception('/bin/busybox không tồn tại sau khi giải nén - '
-          'tar.gz tải về có thể bị hỏng/thiếu. Thử tải lại.');
+      throw Exception('/bin/busybox không tồn tại sau khi giải nén.');
     }
 
     try {
       final shLink = Link('$rootfs/bin/sh');
       if (shLink.existsSync()) await shLink.delete();
-      if (File('$rootfs/bin/sh').existsSync()) {
-        File('$rootfs/bin/sh').deleteSync();
-      }
+      if (File('$rootfs/bin/sh').existsSync()) File('$rootfs/bin/sh').deleteSync();
       shLink.createSync('busybox');
-      _log('✅ Đã tạo (best-effort) /bin/sh -> busybox.');
+      _log('✅ Đã tạo /bin/sh -> busybox.');
     } catch (e) {
-      _log('ℹ️ Không tạo được symlink /bin/sh ($e) - không sao, sẽ dùng '
-          '"busybox sh" trực tiếp khi chạy.');
+      _log('ℹ️ Không tạo được symlink /bin/sh ($e) - không sao.');
     }
 
     onProgress(1.0);
@@ -168,61 +157,49 @@ class PRootService {
       throw Exception('Không tìm thấy libproot.so tại: $prootBin');
     }
 
-    // ---- Loader từ nativeLibraryDir (không cần chmod) ----
+    // Loader từ nativeLibraryDir (đã có quyền thực thi từ Android)
     final loaderPath = '$libDir/libproot-loader.so';
     final loader32Path = '$libDir/libproot-loader32.so';
     if (!File(loaderPath).existsSync()) {
-      throw Exception(
-        'Không tìm thấy $loaderPath. Cần build lại APK với '
-        'scripts/fetch_native_binaries.sh bản mới (đã bổ sung tải '
-        'libexec/proot/loader từ gói .deb của Termux).',
-      );
+      throw Exception('Không tìm thấy $loaderPath. Cần build lại APK.');
     }
 
-    // ---- Tạo symlink trong filesDir để tránh đường dẫn dài (không cần chmod) ----
+    // Tạo symlink trong filesDir để tránh ký tự đặc biệt trong đường dẫn
     final loaderSymlink = '$filesDir/loader';
-    if (await File(loaderSymlink).exists()) {
-      await File(loaderSymlink).delete();
-    }
+    if (await File(loaderSymlink).exists()) await File(loaderSymlink).delete();
     await Process.run('ln', ['-sf', loaderPath, loaderSymlink]);
     _log('ℹ️ Tạo symlink loader: $loaderSymlink -> $loaderPath');
 
     String? loader32Symlink;
     if (File(loader32Path).existsSync()) {
       loader32Symlink = '$filesDir/loader32';
-      if (await File(loader32Symlink).exists()) {
-        await File(loader32Symlink).delete();
-      }
+      if (await File(loader32Symlink).exists()) await File(loader32Symlink).delete();
       await Process.run('ln', ['-sf', loader32Path, loader32Symlink]);
       _log('ℹ️ Tạo symlink loader32: $loader32Symlink -> $loader32Path');
     }
 
-    // ---- Xử lý tmpDir ----
+    // tmpDir
     final tmpDir = '$filesDir/proot-tmp';
     if (await Directory(tmpDir).exists()) {
       await Directory(tmpDir).delete(recursive: true);
     }
     Directory(tmpDir).createSync(recursive: true);
 
-    // ---- Xử lý command ----
-    if (command.isEmpty) {
-      command = ['/bin/sh', '-l'];
-    }
+    // Xử lý command: nếu là /bin/sh thì chuyển thành /bin/busybox sh
+    if (command.isEmpty) command = ['/bin/sh', '-l'];
     final effectiveCommand = List<String>.from(command);
     if (effectiveCommand.isNotEmpty && effectiveCommand.first == '/bin/sh') {
       effectiveCommand
         ..removeAt(0)
         ..insertAll(0, ['/bin/busybox', 'sh']);
-      _log('ℹ️ Đổi lệnh khởi chạy: /bin/sh -> /bin/busybox sh (không cần symlink)');
+      _log('ℹ️ Đổi /bin/sh -> /bin/busybox sh');
     }
 
-    // ---- Xây dựng args với --loader ----
+    // Xây dựng args (KHÔNG có --loader)
     final args = <String>[
       '-0',
       '--link2symlink',
       '--kill-on-exit',
-      '--loader', loaderSymlink,
-      if (loader32Symlink != null) ...['--loader32', loader32Symlink],
       '-r', rootfs,
       '-b', '/dev',
       '-b', '/proc',
@@ -232,10 +209,10 @@ class PRootService {
       ...effectiveCommand,
     ];
 
-    // ---- Môi trường ----
+    // Môi trường: chỉ set PROOT_LOADER qua environment
     final env = <String, String>{
       'PROOT_TMP_DIR': tmpDir,
-      'PROOT_LOADER': loaderSymlink,
+      'PROOT_LOADER': loaderSymlink,      // Quan trọng: dùng symlink
       if (loader32Symlink != null) 'PROOT_LOADER_32': loader32Symlink,
       'LD_LIBRARY_PATH': libDir,
       'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
@@ -246,7 +223,7 @@ class PRootService {
     };
 
     _log('🚀 Khởi chạy: $prootBin ${args.join(' ')}');
-    _log('   Loader: $loaderSymlink');
+    _log('   PROOT_LOADER=$loaderSymlink');
 
     final process = await Process.start(
       prootBin,
