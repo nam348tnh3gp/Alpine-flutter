@@ -15,6 +15,15 @@ ALPINE_REPO_BASE="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main"
 declare -A ARCH_MAP=( ["aarch64"]="arm64-v8a" ["arm"]="armeabi-v7a" )
 declare -A ALPINE_ARCH_MAP=( ["aarch64"]="aarch64" ["arm"]="armhf" )
 
+# Hàm chuyển đổi ABI -> termux arch (ngược với ARCH_MAP)
+abi_to_termux_arch() {
+    case "$1" in
+        arm64-v8a) echo "aarch64" ;;
+        armeabi-v7a) echo "arm" ;;
+        *) echo "" ;;
+    esac
+}
+
 if ! command -v patchelf &>/dev/null; then
     echo "patchelf chưa có, đang cài đặt..."
     sudo apt-get update -qq && sudo apt-get install -y -qq patchelf
@@ -336,7 +345,6 @@ for termux_arch in aarch64 arm; do
 done
 
 echo "=== Phân tích NEEDED đệ quy và tải bổ sung ==="
-# Lặp cho đến khi không còn NEEDED mới
 MAX_ITER=10
 for ((iter=0; iter<MAX_ITER; iter++)); do
     changed=0
@@ -349,17 +357,23 @@ for ((iter=0; iter<MAX_ITER; iter++)); do
                 if is_system_lib "$lib"; then
                     continue
                 fi
+                # Loại bỏ version suffix nếu có để lấy tên cơ bản
+                base_lib="${lib%%.so*}.so"
                 # Bỏ qua nếu đã có file
-                target="$lib_dir/$lib"
+                target="$lib_dir/$base_lib"
                 if [ -f "$target" ] && [ -s "$target" ]; then
                     continue
                 fi
                 # Tải thư viện
-                termux_arch="${ARCH_MAP[$abi]}"
-                if fetch_library_by_name "$termux_arch" "$lib"; then
+                termux_arch="$(abi_to_termux_arch "$abi")"
+                if [ -z "$termux_arch" ]; then
+                    echo "!! Không xác định được termux_arch cho ABI $abi" >&2
+                    continue
+                fi
+                if fetch_library_by_name "$termux_arch" "$base_lib"; then
                     changed=1
                 else
-                    echo "!! Không thể tải $lib cho $abi" >&2
+                    echo "!! Không thể tải $base_lib cho $abi" >&2
                 fi
             done
         done
