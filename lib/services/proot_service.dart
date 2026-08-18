@@ -236,20 +236,44 @@ class PRootService {
       ...effectiveCommand,
     ];
 
+    // QUAN TRONG (fix W^X "execve(...): Permission denied"): ban proot cua
+    // Termux cho Android khong execve() thang file trong rootfs. No dung
+    // mot "loader" rieng (nam trong nativeLibraryDir - noi DUY NHAT duoc
+    // Android cho phep exec bat chap SELinux W^X) de tu doc/anh xa ELF vao
+    // bo nho roi nhay vao entry point, thay vi goi execve() that su tren
+    // file nam trong /data/user/0/.../alpine-rootfs (bi chan). Neu khong
+    // khai bao PROOT_LOADER, proot roi ve execve() thang -> loi da gap.
+    final loaderPath = '$libDir/libproot-loader.so';
+    final loader32Path = '$libDir/libproot-loader32.so';
+    if (!File(loaderPath).existsSync()) {
+      throw Exception(
+        'Không tìm thấy $loaderPath. Cần build lại APK với '
+        'scripts/fetch_native_binaries.sh bản mới (đã bổ sung tải '
+        'libexec/proot/loader từ gói .deb của Termux).',
+      );
+    }
+
+    final env = <String, String>{
+      'PROOT_TMP_DIR': tmpDir,
+      'PROOT_LOADER': loaderPath,
+      'LD_LIBRARY_PATH': libDir,
+      'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+      'HOME': '/root',
+      'TERM': 'xterm-256color',
+      'COLUMNS': '80',
+      'LINES': '24',
+    };
+    if (File(loader32Path).existsSync()) {
+      env['PROOT_LOADER_32'] = loader32Path;
+    }
+
     _log('🚀 Khởi chạy: $prootBin ${args.join(' ')}');
+    _log('   PROOT_LOADER=$loaderPath');
 
     final process = await Process.start(
       prootBin,
       args,
-      environment: {
-        'PROOT_TMP_DIR': tmpDir,
-        'LD_LIBRARY_PATH': libDir,
-        'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-        'HOME': '/root',
-        'TERM': 'xterm-256color',
-        'COLUMNS': '80',
-        'LINES': '24',
-      },
+      environment: env,
       runInShell: false,
     );
 
