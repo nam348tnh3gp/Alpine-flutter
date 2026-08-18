@@ -21,13 +21,16 @@ android {
     defaultConfig {
         applicationId = "com.example.alpinerunner"
         minSdk = 26
-        // 🔥 QUAN TRỌNG: hạ targetSdk về 28 để tắt W^X
-        targetSdk = 28
+        targetSdk = 28   // 🔥 bypass W^X
         versionCode = 1
         versionName = "1.0.0"
     }
 
-    // Ép extract lib*.so ra nativeLibraryDir
+    // 🔥 Tắt lint ExpiredTargetSdkVersion vì app không publish lên Play Store
+    lint {
+        disable 'ExpiredTargetSdkVersion'
+    }
+
     packagingOptions {
         jniLibs {
             useLegacyPackaging = true
