@@ -14,19 +14,13 @@ class PRootService {
 
   final void Function(String line) onLog;
   Process? _currentProcess;
-  
-  // 🔥 Buffer để lưu log
   final StringBuffer _logBuffer = StringBuffer();
 
   PRootService({required this.onLog});
 
-  // 🔥 Lấy toàn bộ log
   String getLogs() => _logBuffer.toString();
-  
-  // 🔥 Xóa log
   void clearLogs() => _logBuffer.clear();
 
-  // 🔥 Log có buffer
   void _log(String message) {
     _logBuffer.writeln(message);
     onLog(message);
@@ -40,6 +34,21 @@ class PRootService {
   Future<bool> isInstalled() async {
     final rootfs = await _rootfsDir();
     return File('$rootfs/etc/alpine-release').existsSync();
+  }
+
+  // 🔥 Tạo symlink cho busybox applet
+  Future<String> _createBusyboxSymlink(String applet, String libDir) async {
+    final filesDir = await NativeBridge.getFilesDir();
+    final symlinkDir = '$filesDir/busybox-links';
+    await Directory(symlinkDir).create(recursive: true);
+    final linkPath = '$symlinkDir/$applet';
+    
+    final busyboxPath = '$libDir/libbusybox.so';
+    if (!File(linkPath).existsSync()) {
+      await Process.run('ln', ['-sf', busyboxPath, linkPath]);
+      _log('✅ Đã tạo symlink: $applet -> libbusybox.so');
+    }
+    return linkPath;
   }
 
   Future<void> bootstrap({required void Function(double) onProgress}) async {
@@ -64,8 +73,7 @@ class PRootService {
     final response = await http.Client().send(request);
 
     if (response.statusCode != 200) {
-      throw Exception('Tải rootfs thất bại: HTTP ${response.statusCode}. '
-          'Kiểm tra lại URL/version Alpine trong proot_service.dart');
+      throw Exception('Tải rootfs thất bại: HTTP ${response.statusCode}.');
     }
 
     final total = response.contentLength ?? 0;
@@ -78,55 +86,15 @@ class PRootService {
     }
     await sink.close();
 
-    final busyboxSrc = '$libDir/libbusybox.so';
-    _log('📦 Kiểm tra libbusybox.so tại: $busyboxSrc');
-
-    if (!File(busyboxSrc).existsSync()) {
-      final altPaths = [
-        '$libDir/../libbusybox.so',
-        '/system/lib/libbusybox.so',
-        '/data/local/tmp/libbusybox.so',
-      ];
-      String? foundPath;
-      for (var p in altPaths) {
-        if (File(p).existsSync()) {
-          foundPath = p;
-          break;
-        }
-      }
-
-      if (foundPath != null) {
-        _log('✅ Tìm thấy libbusybox.so tại: $foundPath');
-        await File(foundPath).copy(busyboxSrc);
-        await _chmodX(busyboxSrc);
-      } else {
-        throw Exception(
-          'Không tìm thấy libbusybox.so trong native libs ($busyboxSrc). '
-          'Kiểm tra bước "Tải native binaries" trong .github/workflows/build.yml '
-          'đã tải busybox-static thành công chưa.',
-        );
-      }
-    }
-
-    // Tạo symlink để gọi busybox đúng cách
-    final tempBinDir = Directory('$filesDir/busybox-bin');
-    if (await tempBinDir.exists()) {
-      await tempBinDir.delete(recursive: true);
-    }
-    await tempBinDir.create(recursive: true);
-
-    final tarLink = File('${tempBinDir.path}/tar');
-    await Process.run('ln', ['-sf', busyboxSrc, tarLink.path]);
-
-    _log('✅ Đã tạo symlink tar -> busybox');
-    _log('📦 Giải nén rootfs...');
+    // 🔥 Tạo symlink tar -> libbusybox.so
+    final tarLink = await _createBusyboxSymlink('tar', libDir);
+    _log('📦 Giải nén rootfs bằng busybox tar...');
     onProgress(0.87);
 
     final result = await Process.run(
-      tarLink.path,
+      tarLink,
       ['xzf', tarGzPath, '-C', rootfs],
       environment: {
-        'LD_LIBRARY_PATH': libDir,
         'PATH': '/bin:/system/bin:/system/xbin',
       },
     );
@@ -143,23 +111,15 @@ class PRootService {
           ['-xzf', tarGzPath, '-C', rootfs],
         );
         if (result2.exitCode != 0) {
-          throw Exception(
-            'Giải nén rootfs thất bại cả 2 cách: '
-            'busybox: ${result.stderr}, host tar: ${result2.stderr}',
-          );
+          throw Exception('Giải nén thất bại: ${result2.stderr}');
         }
       } else {
-        throw Exception(
-          'Giải nén rootfs thất bại (busybox tar exit=${result.exitCode}): '
-          '${result.stderr}',
-        );
+        throw Exception('Giải nén rootfs thất bại: ${result.stderr}');
       }
     }
 
-    await tempBinDir.delete(recursive: true).catchError((_) {});
-
     onProgress(0.95);
-    await File(tarGzPath).delete().catchError((_) => File(tarGzPath));
+    await File(tarGzPath).delete().catchError((_) {});
 
     for (final d in ['proc', 'sys', 'dev', 'tmp', 'root']) {
       Directory('$rootfs/$d').createSync(recursive: true);
@@ -168,23 +128,25 @@ class PRootService {
     File('$rootfs/etc/resolv.conf')
         .writeAsStringSync('nameserver 8.8.8.8\nnameserver 1.1.1.1\n');
 
+    // 🔥 Tạo /bin/sh nếu chưa có
     final shPath = '$rootfs/bin/sh';
     if (!File(shPath).existsSync()) {
       _log('⚠️ /bin/sh không tồn tại! Tạo từ busybox...');
-      await File(busyboxSrc).copy('$rootfs/bin/busybox');
-      await _chmodX('$rootfs/bin/busybox');
-
+      final busyboxPath = '$libDir/libbusybox.so';
+      await File(busyboxPath).copy('$rootfs/bin/busybox');
+      await Process.run('chmod', ['+x', '$rootfs/bin/busybox']);
+      
       try {
         await Process.run('ln', ['-sf', '/bin/busybox', shPath]);
         _log('✅ Đã tạo symlink /bin/sh -> busybox');
       } catch (e) {
-        _log('⚠️ Không tạo được symlink, copy busybox thành sh');
-        await File(busyboxSrc).copy(shPath);
-        await _chmodX(shPath);
+        _log('⚠️ Copy busybox thành sh');
+        await File(busyboxPath).copy(shPath);
+        await Process.run('chmod', ['+x', shPath]);
       }
     }
 
-    if (File('$rootfs/bin/sh').existsSync()) {
+    if (File(shPath).existsSync()) {
       _log('✅ Shell đã sẵn sàng!');
     } else {
       _log('❌ VẪN CHƯA CÓ /bin/sh!');
@@ -192,22 +154,6 @@ class PRootService {
 
     onProgress(1.0);
     _log('✅ Hoàn tất cài đặt Alpine rootfs tại: $rootfs');
-  }
-
-  Future<void> _chmodX(String path) async {
-    try {
-      await Process.run('chmod', ['+x', path]);
-    } catch (_) {
-      await Process.run('chmod', ['755', path]);
-    }
-  }
-
-  // 🔥 RESIZE TERMINAL
-  void resizeTerminal(int columns, int lines) {
-    if (_currentProcess != null) {
-      _currentProcess!.kill(ProcessSignal.sigwinch);
-      _log('📐 Terminal resized to ${columns}x${lines}');
-    }
   }
 
   Future<Process> start({
@@ -231,22 +177,17 @@ class PRootService {
     }
     Directory(tmpDir).createSync(recursive: true);
 
-    if (command.isEmpty) {
-      command = ['/bin/sh', '-l'];
-    }
+    // 🔥 Tạo symlink sh -> libbusybox.so nếu cần
+    final shLink = await _createBusyboxSymlink('sh', libDir);
 
-    final shPath = '$rootfs/bin/sh';
-    if (!File(shPath).existsSync()) {
-      _log('⚠️ /bin/sh không tồn tại! Thử dùng busybox...');
-      final busyboxHost = '$libDir/libbusybox.so';
-      if (File(busyboxHost).existsSync()) {
-        command = ['/host-libs/libbusybox.so', 'sh', '-l'];
-        _log('🔄 Chuyển sang dùng busybox từ host');
+    // Nếu command là /bin/sh và không tồn tại, dùng symlink
+    if (command.isEmpty || command[0] == '/bin/sh') {
+      final shPath = '$rootfs/bin/sh';
+      if (!File(shPath).existsSync()) {
+        _log('⚠️ /bin/sh không tồn tại! Dùng busybox symlink');
+        command = [shLink, '-l'];
       } else {
-        throw Exception(
-          'Không tìm thấy shell: $shPath. '
-          'Kiểm tra quá trình cài đặt rootfs.',
-        );
+        command = ['/bin/sh', '-l'];
       }
     }
 
