@@ -142,6 +142,7 @@ class PRootService {
     _log('✅ Hoàn tất cài đặt Alpine rootfs tại: $rootfs');
   }
 
+  // === START (phiên bản tối giản, không loader, không bind mount) ===
   Future<Process> start({
     required List<String> command,
     void Function(String)? onStdout,
@@ -156,34 +157,23 @@ class PRootService {
       throw Exception('Không tìm thấy libproot.so tại: $prootBin');
     }
 
-    // ---- Sử dụng loader trực tiếp từ nativeLibraryDir ----
-    final loaderPath = '$libDir/libproot-loader.so';
-    if (!File(loaderPath).existsSync()) {
-      throw Exception('Không tìm thấy loader tại $loaderPath.');
-    }
-    // loader32 (optional)
-    final loader32Path = '$libDir/libproot-loader32.so';
-
-    // ---- tmpDir ----
     final tmpDir = '$filesDir/proot-tmp';
     if (await Directory(tmpDir).exists()) {
       await Directory(tmpDir).delete(recursive: true);
     }
     Directory(tmpDir).createSync(recursive: true);
 
-    // ---- Xử lý command: luôn dùng /bin/busybox trong rootfs ----
     if (command.isEmpty) command = ['/bin/sh', '-l'];
     final effectiveCommand = List<String>.from(command);
+    // Không cần đổi /bin/sh -> busybox vì rootfs đã có symlink
+    // Nhưng nếu muốn an toàn, vẫn giữ
     if (effectiveCommand.isNotEmpty && effectiveCommand.first == '/bin/sh') {
-      effectiveCommand
-        ..removeAt(0)
-        ..insertAll(0, ['/bin/busybox', 'sh']);
+      effectiveCommand.removeAt(0);
+      effectiveCommand.insertAll(0, ['/bin/busybox', 'sh']);
       _log('ℹ️ Dùng busybox trong rootfs: /bin/busybox sh');
     }
 
-    // ---- Args ----
     final args = <String>[
-      '-v', '5',
       '-0',
       '--link2symlink',
       '--kill-on-exit',
@@ -196,11 +186,8 @@ class PRootService {
       ...effectiveCommand,
     ];
 
-    // ---- Môi trường ----
     final env = <String, String>{
       'PROOT_TMP_DIR': tmpDir,
-      'PROOT_LOADER': loaderPath,
-      if (File(loader32Path).existsSync()) 'PROOT_LOADER_32': loader32Path,
       'LD_LIBRARY_PATH': libDir,
       'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
       'HOME': '/root',
@@ -210,7 +197,6 @@ class PRootService {
     };
 
     _log('🚀 Khởi chạy: $prootBin ${args.join(' ')}');
-    _log('   PROOT_LOADER=$loaderPath');
 
     final process = await Process.start(
       prootBin,
@@ -219,11 +205,8 @@ class PRootService {
       runInShell: false,
     );
 
-    process.stderr.transform(utf8.decoder).listen((s) {
-      _log('[proot] $s');
-      onStderr?.call(s);
-    });
     process.stdout.transform(utf8.decoder).listen((s) => onStdout?.call(s));
+    process.stderr.transform(utf8.decoder).listen((s) => onStderr?.call(s));
     process.exitCode.then((code) => _log('Process exited with code $code'));
 
     _currentProcess = process;
