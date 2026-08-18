@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; // Thêm cho Clipboard
 import 'package:url_launcher/url_launcher.dart';
 import 'package:xterm/xterm.dart';
 import '../services/proot_service.dart';
@@ -47,10 +48,27 @@ class _HomeScreenState extends State<HomeScreen> {
       await _proot.bootstrap(onProgress: (p) => setState(() => _progress = p));
       setState(() => _installed = true);
     } catch (e) {
-      _terminal.write('LỖI cài đặt: $e\r\n');
+      _terminal.write('❌ LỖI cài đặt: $e\r\n');
     } finally {
       setState(() => _installing = false);
     }
+  }
+
+  // 🔥 COPY LOG
+  Future<void> _copyLog() async {
+    final logs = _proot.getLogs();
+    if (logs.isNotEmpty) {
+      await Clipboard.setData(ClipboardData(text: logs));
+      _terminal.write('\r\n📋 Đã copy log vào clipboard!\r\n');
+    } else {
+      _terminal.write('\r\n⚠️ Không có log để copy.\r\n');
+    }
+  }
+
+  // 🔥 CLEAR LOG
+  void _clearLog() {
+    _proot.clearLogs();
+    _terminal.write('\r\n🗑️ Đã xóa log.\r\n');
   }
 
   Future<void> _launchCli() async {
@@ -61,11 +79,15 @@ class _HomeScreenState extends State<HomeScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       FocusScope.of(context).requestFocus(_terminalFocusNode);
     });
-    await _proot.start(
-      command: ['/bin/sh', '-l'],
-      onStdout: (s) => _terminal.write(s),
-      onStderr: (s) => _terminal.write(s),
-    );
+    try {
+      await _proot.start(
+        command: ['/bin/sh', '-l'],
+        onStdout: (s) => _terminal.write(s),
+        onStderr: (s) => _terminal.write(s),
+      );
+    } catch (e) {
+      _terminal.write('❌ LỖI khởi chạy: $e\r\n');
+    }
   }
 
   Future<void> _launchGui() async {
@@ -76,20 +98,24 @@ class _HomeScreenState extends State<HomeScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       FocusScope.of(context).requestFocus(_terminalFocusNode);
     });
-    await _proot.start(
-      command: ['/bin/sh', '/usr/local/bin/start-gui.sh'],
-      onStdout: (s) => _terminal.write(s),
-      onStderr: (s) => _terminal.write(s),
-    );
-    await Future.delayed(const Duration(seconds: 2));
-    await _openRealVnc();
+    try {
+      await _proot.start(
+        command: ['/bin/sh', '/usr/local/bin/start-gui.sh'],
+        onStdout: (s) => _terminal.write(s),
+        onStderr: (s) => _terminal.write(s),
+      );
+      await Future.delayed(const Duration(seconds: 2));
+      await _openRealVnc();
+    } catch (e) {
+      _terminal.write('❌ LỖI khởi chạy GUI: $e\r\n');
+    }
   }
 
   Future<void> _openRealVnc() async {
     final uri = Uri.parse('vnc://127.0.0.1:5900');
     if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
       _terminal.write(
-          '\r\nKhông mở được RealVNC Viewer. Hãy cài app "RealVNC Viewer" '
+          '\r\n📱 Không mở được RealVNC Viewer. Hãy cài app "RealVNC Viewer" '
           'từ Play Store rồi kết nối thủ công tới 127.0.0.1:5900\r\n');
     }
   }
@@ -97,7 +123,23 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Alpine Runner (proot, no root)')),
+      appBar: AppBar(
+        title: const Text('Alpine Runner (proot, no root)'),
+        actions: [
+          // 🔥 Nút COPY LOG
+          IconButton(
+            icon: const Icon(Icons.copy),
+            onPressed: _running ? _copyLog : null,
+            tooltip: 'Copy log',
+          ),
+          // 🔥 Nút CLEAR LOG
+          IconButton(
+            icon: const Icon(Icons.clear),
+            onPressed: _running ? _clearLog : null,
+            tooltip: 'Clear log',
+          ),
+        ],
+      ),
       body: Column(
         children: [
           if (!_installed) _buildInstallPanel(),
@@ -107,6 +149,8 @@ class _HomeScreenState extends State<HomeScreen> {
               child: TerminalView(
                 _terminal,
                 focusNode: _terminalFocusNode,
+                // 🔥 BẬT CHẾ ĐỘ CHỌN VĂN BẢN
+                selectionMode: SelectionMode.on,
               ),
             ),
         ],
@@ -119,7 +163,7 @@ class _HomeScreenState extends State<HomeScreen> {
       padding: const EdgeInsets.all(24),
       child: Column(
         children: [
-          const Text('Chưa cài Alpine rootfs.'),
+          const Text('📥 Chưa cài Alpine rootfs.'),
           const SizedBox(height: 12),
           if (_installing) ...[
             LinearProgressIndicator(value: _progress > 0 ? _progress : null),
@@ -147,12 +191,12 @@ class _HomeScreenState extends State<HomeScreen> {
           FilledButton.icon(
             onPressed: _launchCli,
             icon: const Icon(Icons.terminal),
-            label: const Text('Chế độ CLI'),
+            label: const Text('🖥️ CLI'),
           ),
           FilledButton.icon(
             onPressed: _launchGui,
             icon: const Icon(Icons.desktop_windows),
-            label: const Text('Chế độ GUI (qua RealVNC)'),
+            label: const Text('🖥️ GUI (VNC)'),
           ),
         ],
       ),
