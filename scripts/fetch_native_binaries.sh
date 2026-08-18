@@ -1,5 +1,5 @@
 #!/bin/bash
-# Tự build proot + loader từ source (oonid/pr) và tải busybox-static từ Alpine.
+# Tự build proot + loader từ source (oonid/pr) - chỉ lấy những phần cần thiết.
 # Đặt vào jniLibs/<abi>/lib*.so để lách W^X.
 # Chạy trong GitHub Actions.
 
@@ -27,7 +27,7 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 
 cd "$WORK_DIR"
 
-# Chuyển SSH -> HTTPS để submodule clone bằng HTTPS
+# Chuyển SSH -> HTTPS để clone submodule
 git config --global url."https://github.com/".insteadOf git@github.com:
 if [ -n "${GITHUB_TOKEN:-}" ]; then
     git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf git@github.com:
@@ -36,23 +36,13 @@ fi
 git clone --depth 1 https://github.com/oonid/pr.git proot-builder
 cd proot-builder
 
-# 🔥 Xóa submodule termlib bị lỗi (không cần cho build proot)
-if grep -q "vendor/termlib" .gitmodules; then
-    echo "Đang xóa submodule vendor/termlib khỏi .gitmodules..."
-    sed -i '/vendor\/termlib/d' .gitmodules
-    git config -f .gitmodules --remove-section "submodule.vendor/termlib" 2>/dev/null || true
-    # Xóa tham chiếu trong .git/config nếu có
-    git config --remove-section "submodule.vendor/termlib" 2>/dev/null || true
-    rm -rf vendor/termlib
-fi
-
-# Cập nhật submodule (chỉ các module còn lại)
-git submodule sync
-git submodule update --init --recursive --depth=1
+# 🔥 Chỉ update 2 submodule cần thiết: vendor/proot và vendor/samba
+git submodule update --init vendor/proot vendor/samba
 
 # Build cho arm64 và arm
 for arch in arm64 arm; do
     echo "[build] Đang build cho $arch ..."
+    # Thử build với --skip-ndk, nếu fail thì build bình thường (sẽ tải NDK)
     ./scripts/build.sh --arch="$arch" --skip-ndk 2>/dev/null || {
         ./scripts/build.sh --arch="$arch"
     }
@@ -71,7 +61,7 @@ chmod 755 "$OLDPWD/$JNI_DIR/arm64-v8a/libproot.so" \
 
 echo "✅ Build proot + loader hoàn tất"
 
-# ---- Tải busybox-static từ Alpine (giữ nguyên logic cũ) ----
+# ---- Tải busybox-static từ Alpine ----
 echo "=== Tải busybox-static từ Alpine ==="
 
 fetch_busybox_alpine() {
