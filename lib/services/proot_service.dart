@@ -156,16 +156,26 @@ class PRootService {
       throw Exception('Không tìm thấy libproot.so tại: $prootBin');
     }
 
-    // ---- Sử dụng loader và busybox trực tiếp từ libDir ----
-    final loaderPath = '$libDir/libproot-loader.so';
-    final loader32Path = '$libDir/libproot-loader32.so';
-    if (!File(loaderPath).existsSync()) {
-      throw Exception('Không tìm thấy loader tại $loaderPath.');
+    // ---- Copy loader vào filesDir để đảm bảo đường dẫn sạch và quyền exec ----
+    final loaderSource = '$libDir/libproot-loader.so';
+    final loaderCopy = '$filesDir/loader';
+    if (!File(loaderSource).existsSync()) {
+      throw Exception('Không tìm thấy loader tại $loaderSource.');
     }
+    if (await File(loaderCopy).exists()) await File(loaderCopy).delete();
+    await File(loaderSource).copy(loaderCopy);
+    await Process.run('chmod', ['755', loaderCopy]);
+    _log('✅ Loader ready: $loaderCopy');
 
-    final busyboxPath = '$libDir/libbusybox.so';
-    if (!File(busyboxPath).existsSync()) {
-      throw Exception('Không tìm thấy busybox tại $busyboxPath.');
+    // ---- loader32 (optional) ----
+    final loader32Source = '$libDir/libproot-loader32.so';
+    String? loader32Copy;
+    if (File(loader32Source).existsSync()) {
+      loader32Copy = '$filesDir/loader32';
+      if (await File(loader32Copy).exists()) await File(loader32Copy).delete();
+      await File(loader32Source).copy(loader32Copy);
+      await Process.run('chmod', ['755', loader32Copy]);
+      _log('✅ Loader32 ready: $loader32Copy');
     }
 
     // ---- tmpDir ----
@@ -175,17 +185,17 @@ class PRootService {
     }
     Directory(tmpDir).createSync(recursive: true);
 
-    // ---- Xử lý command ----
+    // ---- Xử lý command: luôn dùng /bin/busybox trong rootfs ----
     if (command.isEmpty) command = ['/bin/sh', '-l'];
     final effectiveCommand = List<String>.from(command);
     if (effectiveCommand.isNotEmpty && effectiveCommand.first == '/bin/sh') {
       effectiveCommand
         ..removeAt(0)
-        ..insertAll(0, ['/host-libs/libbusybox.so', 'sh']);
-      _log('ℹ️ Dùng busybox từ host-libs: /host-libs/libbusybox.so');
+        ..insertAll(0, ['/bin/busybox', 'sh']);
+      _log('ℹ️ Dùng busybox trong rootfs: /bin/busybox sh');
     }
 
-    // ---- Args với verbose và bind mount libDir ----
+    // ---- Args (không bind mount libDir) ----
     final args = <String>[
       '-v', '5',
       '-0',
@@ -196,7 +206,6 @@ class PRootService {
       '-b', '/proc',
       '-b', '/sys',
       '-b', '$tmpDir:/tmp',
-      '-b', '$libDir:/host-libs',   // Bind nativeLibraryDir vào guest
       '-w', '/root',
       ...effectiveCommand,
     ];
@@ -204,8 +213,8 @@ class PRootService {
     // ---- Môi trường ----
     final env = <String, String>{
       'PROOT_TMP_DIR': tmpDir,
-      'PROOT_LOADER': loaderPath,
-      if (File(loader32Path).existsSync()) 'PROOT_LOADER_32': loader32Path,
+      'PROOT_LOADER': loaderCopy,
+      if (loader32Copy != null) 'PROOT_LOADER_32': loader32Copy,
       'LD_LIBRARY_PATH': libDir,
       'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
       'HOME': '/root',
@@ -215,7 +224,7 @@ class PRootService {
     };
 
     _log('🚀 Khởi chạy: $prootBin ${args.join(' ')}');
-    _log('   PROOT_LOADER=$loaderPath');
+    _log('   PROOT_LOADER=$loaderCopy');
 
     final process = await Process.start(
       prootBin,
@@ -224,7 +233,6 @@ class PRootService {
       runInShell: false,
     );
 
-    // Lắng nghe stderr để xem log verbose
     process.stderr.transform(utf8.decoder).listen((s) {
       _log('[proot] $s');
       onStderr?.call(s);
