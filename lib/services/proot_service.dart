@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'package:archive/archive_io.dart';
+import 'package:tar/tar.dart';
 import 'package:http/http.dart' as http;
 import 'native_bridge.dart';
 
@@ -9,8 +9,9 @@ import 'native_bridge.dart';
 /// binary nào (tar/busybox...) trực tiếp trên host để giải nén - Android áp
 /// seccomp-bpf cho tiến trình app, nhiều syscall mà tar/musl dùng bị chặn,
 /// gây crash SIGSYS (exitCode âm, vd -31) ngay cả khi binary hợp lệ và có
-/// quyền exec. Giải nén bằng package:archive thuần Dart (không qua syscall
-/// lạ nào ngoài file I/O thông thường mà Flutter vẫn dùng hằng ngày).
+/// quyền exec. Giải nén bằng package:tar thuần Dart (không qua syscall lạ
+/// nào ngoài file I/O thông thường), có hỗ trợ symlink đầy đủ và đáng tin
+/// cậy hơn package:archive (từng thiếu xử lý symlink cho định dạng TAR).
 class PRootService {
   static const _alpineVersion = '3.19.9';
 
@@ -47,17 +48,16 @@ class PRootService {
 
   Future<bool> isInstalled() async {
     final rootfs = await _rootfsDir();
-    // Kiểm tra CẢ HAI: alpine-release (rootfs đã giải nén) VÀ /bin/sh thực
-    // sự resolve được (không phải symlink gãy). Nếu lần trước bootstrap bị
-    // crash giữa chừng, alpine-release có thể đã tồn tại nhưng /bin/sh thì
-    // chưa -> phải coi là CHƯA cài để tự động cài lại từ đầu.
+    // Không còn kiểm tra /bin/sh: chuyển sang gọi trực tiếp "busybox sh"
+    // (multi-call binary, không cần symlink riêng - xem hàm start()).
+    // Chỉ cần chắc chắn /bin/busybox (file thật, không phải symlink) tồn
+    // tại và có quyền exec là đủ để chạy được.
     final releaseOk = File('$rootfs/etc/alpine-release').existsSync();
-    final shOk = File('$rootfs/bin/sh').existsSync(); // existsSync() trên
-    // File sẽ follow symlink và trả về false nếu target không tồn tại/gãy.
-    if (releaseOk && !shOk) {
-      _log('⚠️ Phát hiện rootfs cài dở từ lần trước (thiếu /bin/sh khả dụng) - sẽ cài lại.');
+    final busyboxOk = File('$rootfs/bin/busybox').existsSync();
+    if (releaseOk && !busyboxOk) {
+      _log('⚠️ Phát hiện rootfs cài dở từ lần trước (thiếu /bin/busybox) - sẽ cài lại.');
     }
-    return releaseOk && shOk;
+    return releaseOk && busyboxOk;
   }
 
   Future<void> bootstrap({required void Function(double) onProgress}) async {
@@ -94,40 +94,50 @@ class PRootService {
     }
     await sink.close();
 
-    _log('📦 Giải nén rootfs (Dart thuần, không exec native binary)...');
+    _log('📦 Giải nén rootfs bằng package:tar (hỗ trợ symlink đầy đủ, không '
+        'phụ thuộc archive package - biết có bug thiếu symlink cho định dạng '
+        'TAR)...');
     onProgress(0.72);
 
-    final bytes = File(tarGzPath).readAsBytesSync();
-    final archive = TarDecoder().decodeBytes(GZipDecoder().decodeBytes(bytes));
+    var fileCount = 0, dirCount = 0, linkCount = 0;
+    final tarStream = File(tarGzPath).openRead().transform(gzip.decoder);
+    final reader = TarReader(tarStream);
 
     // QUAN TRỌNG: phải xử lý riêng symlink. Alpine minirootfs có hàng chục
     // symlink (mọi applet busybox: /bin/sh, /bin/ls, /bin/cat... đều trỏ
-    // tới /bin/busybox). Nếu coi mọi entry không phải file là "thư mục",
-    // toàn bộ các symlink này biến thành thư mục rỗng sai, /bin/sh sẽ
-    // KHÔNG tồn tại dù rootfs "giải nén thành công".
-    var fileCount = 0, dirCount = 0, linkCount = 0;
-    for (final entry in archive) {
+    // tới /bin/busybox). package:tar cho biết chính xác entry nào là
+    // TypeFlag.symlink kèm linkName - khác với package:archive từng bị
+    // nhầm các symlink này thành thư mục rỗng.
+    while (await reader.moveNext()) {
+      final entry = reader.current;
+      final header = entry.header;
       final outPath = '$rootfs/${entry.name}';
 
-      if (entry.isSymbolicLink) {
-        final target = entry.nameOfLinkedFile;
-        final linkFile = Link(outPath);
-        Directory(linkFile.path).parent.createSync(recursive: true);
-        if (linkFile.existsSync()) {
-          linkFile.deleteSync();
-        } else if (File(outPath).existsSync()) {
-          File(outPath).deleteSync();
-        }
-        linkFile.createSync(target, recursive: true);
-        linkCount++;
-      } else if (entry.isFile) {
-        final outFile = File(outPath);
-        outFile.parent.createSync(recursive: true);
-        outFile.writeAsBytesSync(entry.content as List<int>);
-        fileCount++;
-      } else {
-        Directory(outPath).createSync(recursive: true);
-        dirCount++;
+      switch (header.typeFlag) {
+        case TypeFlag.symlink:
+          final target = header.linkName;
+          if (target == null) break;
+          Directory(outPath).parent.createSync(recursive: true);
+          final linkFile = Link(outPath);
+          if (linkFile.existsSync()) {
+            await linkFile.delete();
+          } else if (File(outPath).existsSync()) {
+            File(outPath).deleteSync();
+          }
+          await linkFile.create(target, recursive: true);
+          linkCount++;
+          break;
+        case TypeFlag.dir:
+          Directory(outPath).createSync(recursive: true);
+          dirCount++;
+          break;
+        default:
+          // Regular file (và các type ít gặp khác coi như file thường)
+          final outFile = File(outPath);
+          outFile.parent.createSync(recursive: true);
+          await entry.contents.pipe(outFile.openWrite());
+          fileCount++;
+          break;
       }
     }
     _log('   -> $fileCount file, $dirCount thư mục, $linkCount symlink');
@@ -141,21 +151,33 @@ class PRootService {
     File('$rootfs/etc/resolv.conf')
         .writeAsStringSync('nameserver 8.8.8.8\nnameserver 1.1.1.1\n');
 
-    // Cấp lại quyền thực thi cho các binary quan trọng - archive package giữ
-    // nguyên file mode từ tar header trong đa số trường hợp, nhưng chmod lại
-    // /bin/busybox cho chắc chắn (phòng khi mode bị mất khi ghi qua Dart IO).
+    // Cấp lại quyền thực thi cho /bin/busybox - đây là file THẬT (không phải
+    // symlink), nên không có lý do gì nó thiếu ở bước này trừ khi tar.gz
+    // tải về bị hỏng/thiếu.
     final busyboxReal = '$rootfs/bin/busybox';
     if (File(busyboxReal).existsSync()) {
       await _chmodExecutable(busyboxReal);
+    } else {
+      throw Exception('/bin/busybox không tồn tại sau khi giải nén - '
+          'tar.gz tải về có thể bị hỏng/thiếu. Thử tải lại.');
     }
 
-    final shOk = File('$rootfs/bin/sh').existsSync();
-    if (shOk) {
-      _log('✅ Shell /bin/sh đã sẵn sàng (symlink -> busybox).');
-    } else {
-      _log('❌ VẪN CHƯA CÓ /bin/sh sau khi giải nén đúng cách - kiểm tra lại '
-          'file tar.gz tải về có bị hỏng/thiếu không.');
-      throw Exception('/bin/sh không tồn tại sau khi bootstrap.');
+    // Cố gắng tạo /bin/sh -> busybox cho TIỆN (một số script bên trong rootfs
+    // có shebang "#!/bin/sh"), nhưng KHÔNG bắt buộc: dù package:tar giờ đã
+    // tạo symlink đúng ngay từ bước giải nén ở trên, vẫn giữ bước dự phòng
+    // này; nếu vì lý do gì đó vẫn thất bại, start() bên dưới không phụ
+    // thuộc vào symlink này mà gọi thẳng "busybox sh".
+    try {
+      final shLink = Link('$rootfs/bin/sh');
+      if (shLink.existsSync()) await shLink.delete();
+      if (File('$rootfs/bin/sh').existsSync()) {
+        File('$rootfs/bin/sh').deleteSync();
+      }
+      shLink.createSync('busybox');
+      _log('✅ Đã tạo (best-effort) /bin/sh -> busybox.');
+    } catch (e) {
+      _log('ℹ️ Không tạo được symlink /bin/sh ($e) - không sao, sẽ dùng '
+          '"busybox sh" trực tiếp khi chạy.');
     }
 
     onProgress(1.0);
@@ -186,6 +208,17 @@ class PRootService {
       command = ['/bin/sh', '-l'];
     }
 
+    // Không phụ thuộc symlink /bin/sh - dù package:tar giờ tạo symlink đúng,
+    // vẫn giữ đường an toàn này: gọi busybox multi-call binary trực tiếp
+    // ("busybox sh ...") hoạt động y hệt "sh ..." mà không cần symlink nào.
+    final effectiveCommand = List<String>.from(command);
+    if (effectiveCommand.isNotEmpty && effectiveCommand.first == '/bin/sh') {
+      effectiveCommand
+        ..removeAt(0)
+        ..insertAll(0, ['/bin/busybox', 'sh']);
+      _log('ℹ️ Đổi lệnh khởi chạy: /bin/sh -> /bin/busybox sh (không cần symlink)');
+    }
+
     // Không còn cần bind /host-libs hay đường dẫn host nào vào argv: mọi
     // path trong `command` đều là guest path (bên trong -r rootfs), proot
     // tự dịch. libtalloc.so/libandroid-shmem.so được tìm qua rpath $ORIGIN
@@ -200,7 +233,7 @@ class PRootService {
       '-b', '/sys',
       '-b', '$tmpDir:/tmp',
       '-w', '/root',
-      ...command,
+      ...effectiveCommand,
     ];
 
     _log('🚀 Khởi chạy: $prootBin ${args.join(' ')}');
