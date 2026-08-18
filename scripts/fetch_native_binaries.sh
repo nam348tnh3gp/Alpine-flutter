@@ -11,9 +11,7 @@ mkdir -p "$JNI_DIR/arm64-v8a" "$JNI_DIR/armeabi-v7a"
 TERMUX_REPO_BASE="https://packages.termux.dev/apt/termux-main/dists/stable/main"
 ALPINE_REPO_BASE="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main"
 
-# Termux arch -> Android ABI
 declare -A ARCH_MAP=( ["aarch64"]="arm64-v8a" ["arm"]="armeabi-v7a" )
-# Termux arch -> tên arch dùng trong URL Alpine (Alpine gọi 32-bit ARM là "armhf")
 declare -A ALPINE_ARCH_MAP=( ["aarch64"]="aarch64" ["arm"]="armhf" )
 
 if ! command -v patchelf &>/dev/null; then
@@ -21,7 +19,6 @@ if ! command -v patchelf &>/dev/null; then
     sudo apt-get update -qq && sudo apt-get install -y -qq patchelf
 fi
 
-# ---------- Termux: lấy URL .deb mới nhất của 1 package ----------
 termux_deb_url() {
     local termux_arch="$1" pkg_name="$2"
     local idx="$WORK_DIR/Packages-$termux_arch"
@@ -45,7 +42,6 @@ termux_extract_deb() {
     tar -xf "$data_tar" -C "$extract_dir"
 }
 
-# ---------- proot (Termux) ----------
 fetch_proot() {
     local termux_arch="$1"
     local abi="${ARCH_MAP[$termux_arch]}"
@@ -80,17 +76,12 @@ fetch_proot() {
     cp -f "$src" "$target_file"
     chmod 755 "$target_file"
 
-    # RPATH gốc trỏ tới /data/data/com.termux/... không tồn tại trong app của
-    # ta. Đặt lại thành $ORIGIN để proot tìm thư viện phụ thuộc (libtalloc.so)
-    # ngay trong cùng thư mục nativeLibraryDir lúc runtime, không cần
-    # LD_LIBRARY_PATH đặc biệt.
     patchelf --set-rpath '$ORIGIN' "$target_file" \
         || echo "!! patchelf set-rpath thất bại cho $target_file (không chặn build)"
 
     echo "OK: $target_file ($(du -h "$target_file" | cut -f1))"
 }
 
-# ---------- libtalloc (Termux, proot phụ thuộc runtime) ----------
 fetch_libtalloc() {
     local termux_arch="$1"
     local abi="${ARCH_MAP[$termux_arch]}"
@@ -128,9 +119,8 @@ fetch_libtalloc() {
     echo "OK: $target_file ($(du -h "$target_file" | cut -f1))"
 }
 
-# ---------- busybox-static (Alpine) ----------
 fetch_busybox_alpine() {
-    local termux_arch="$1"   # dùng chung key với ARCH_MAP: aarch64 | arm
+    local termux_arch="$1"
     local abi="${ARCH_MAP[$termux_arch]}"
     local alpine_arch="${ALPINE_ARCH_MAP[$termux_arch]}"
     local target_file="$JNI_DIR/$abi/libbusybox.so"
@@ -143,8 +133,6 @@ fetch_busybox_alpine() {
     local apk_index="$WORK_DIR/APKINDEX-$alpine_arch"
     curl -fsSL "$ALPINE_REPO_BASE/$alpine_arch/APKINDEX.tar.gz" | gunzip > "$apk_index"
 
-    # APKINDEX KHÔNG có field "F:" (filename). Tên file thật là "<P>-<V>.apk",
-    # dựng lại từ field P: (tên gói) và V: (version) của đúng record.
     local apk_file
     apk_file=$(awk -v pkg="busybox-static" '
         /^P:/ { p = substr($0, 3) }
@@ -162,10 +150,6 @@ fetch_busybox_alpine() {
     echo "[busybox/$alpine_arch] Tải từ $apk_url"
     curl -fsSL "$apk_url" -o "$apk_path"
 
-    # QUAN TRỌNG: file .apk của Alpine là NHIỀU stream gzip/tar nối liền nhau
-    # (control segment rồi tới data segment). Không có --ignore-zeros, tar
-    # dừng ngay sau segment đầu (chỉ có .PKGINFO...) và sẽ không bao giờ lấy
-    # được bin/busybox.static nằm ở segment data.
     local extract_dir="$WORK_DIR/busybox-${alpine_arch}-extracted"
     mkdir -p "$extract_dir"
     tar --ignore-zeros -xzf "$apk_path" -C "$extract_dir"
@@ -189,6 +173,47 @@ done
 echo "=== Tải libtalloc từ Termux ==="
 for termux_arch in aarch64 arm; do
     fetch_libtalloc "$termux_arch" || exit 1
+done
+
+echo "=== Cưỡng chế đổi tên NEEDED trong libproot.so cho khớp libtalloc.so ==="
+# libproot.so ghi cứng tên thư viện phụ thuộc trong ELF dynamic section
+# (thường là "libtalloc.so.2" có số version). File ta đặt trong jniLibs lại
+# PHẢI tên "libtalloc.so" (không version) vì Android chỉ extract file khớp
+# đúng pattern lib*.so. Nếu không sửa NEEDED, linker tìm đúng chuỗi cũ
+# "libtalloc.so.2", không thấy, proot crash ngay lúc khởi động dù rpath đã
+# đúng. patchelf --replace-needed ép đổi chuỗi đó cho khớp tên file thật.
+fix_proot_needed() {
+    local abi="$1"
+    local proot_file="$JNI_DIR/$abi/libproot.so"
+    [ -f "$proot_file" ] || return 0
+
+    local needed_list
+    needed_list="$(patchelf --print-needed "$proot_file")"
+    echo "[$abi] NEEDED hiện tại của libproot.so:"
+    echo "$needed_list" | sed 's/^/    /'
+
+    local old_name
+    old_name="$(echo "$needed_list" | grep -E '^libtalloc\.so' || true)"
+
+    if [ -z "$old_name" ]; then
+        echo "[$abi] Không thấy NEEDED nào bắt đầu bằng libtalloc.so, bỏ qua."
+        return 0
+    fi
+
+    if [ "$old_name" = "libtalloc.so" ]; then
+        echo "[$abi] NEEDED đã đúng 'libtalloc.so', không cần đổi."
+        return 0
+    fi
+
+    echo "[$abi] Cưỡng chế đổi NEEDED: '$old_name' -> 'libtalloc.so'"
+    patchelf --replace-needed "$old_name" "libtalloc.so" "$proot_file"
+
+    echo "[$abi] NEEDED sau khi patch:"
+    patchelf --print-needed "$proot_file" | sed 's/^/    /'
+}
+
+for abi in arm64-v8a armeabi-v7a; do
+    fix_proot_needed "$abi"
 done
 
 echo "=== Tải busybox-static từ Alpine ==="
