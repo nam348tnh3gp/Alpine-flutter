@@ -156,36 +156,17 @@ class PRootService {
       throw Exception('Không tìm thấy libproot.so tại: $prootBin');
     }
 
-    // ---- Copy loader và busybox vào filesDir ----
-    final loaderSource = '$libDir/libproot-loader.so';
-    final loaderCopy = '$filesDir/loader';
-    if (!File(loaderSource).existsSync()) {
-      throw Exception('Không tìm thấy loader tại $loaderSource. Cần build lại APK.');
-    }
-    if (await File(loaderCopy).exists()) await File(loaderCopy).delete();
-    await File(loaderSource).copy(loaderCopy);
-    await Process.run('chmod', ['755', loaderCopy]);
-    _log('✅ Copied loader: $loaderCopy');
-
-    final loader32Source = '$libDir/libproot-loader32.so';
-    String? loader32Copy;
-    if (File(loader32Source).existsSync()) {
-      loader32Copy = '$filesDir/loader32';
-      if (await File(loader32Copy).exists()) await File(loader32Copy).delete();
-      await File(loader32Source).copy(loader32Copy);
-      await Process.run('chmod', ['755', loader32Copy]);
-      _log('✅ Copied loader32: $loader32Copy');
+    // ---- Sử dụng loader và busybox trực tiếp từ libDir ----
+    final loaderPath = '$libDir/libproot-loader.so';
+    final loader32Path = '$libDir/libproot-loader32.so';
+    if (!File(loaderPath).existsSync()) {
+      throw Exception('Không tìm thấy loader tại $loaderPath.');
     }
 
-    final busyboxSource = '$libDir/libbusybox.so';
-    final busyboxCopy = '$filesDir/busybox';
-    if (!File(busyboxSource).existsSync()) {
-      throw Exception('Không tìm thấy busybox tại $busyboxSource. Cần build lại APK.');
+    final busyboxPath = '$libDir/libbusybox.so';
+    if (!File(busyboxPath).existsSync()) {
+      throw Exception('Không tìm thấy busybox tại $busyboxPath.');
     }
-    if (await File(busyboxCopy).exists()) await File(busyboxCopy).delete();
-    await File(busyboxSource).copy(busyboxCopy);
-    await Process.run('chmod', ['755', busyboxCopy]);
-    _log('✅ Copied busybox: $busyboxCopy');
 
     // ---- tmpDir ----
     final tmpDir = '$filesDir/proot-tmp';
@@ -198,14 +179,13 @@ class PRootService {
     if (command.isEmpty) command = ['/bin/sh', '-l'];
     final effectiveCommand = List<String>.from(command);
     if (effectiveCommand.isNotEmpty && effectiveCommand.first == '/bin/sh') {
-      // Dùng đường dẫn guest (sẽ được bind mount)
       effectiveCommand
         ..removeAt(0)
-        ..insertAll(0, ['/host-files/busybox', 'sh']);
-      _log('ℹ️ Dùng busybox từ guest bind: /host-files/busybox');
+        ..insertAll(0, ['/host-libs/libbusybox.so', 'sh']);
+      _log('ℹ️ Dùng busybox từ host-libs: /host-libs/libbusybox.so');
     }
 
-    // ---- Args với -v 5 để debug và bind mount filesDir vào guest ----
+    // ---- Args với verbose và bind mount libDir ----
     final args = <String>[
       '-v', '5',
       '-0',
@@ -216,7 +196,7 @@ class PRootService {
       '-b', '/proc',
       '-b', '/sys',
       '-b', '$tmpDir:/tmp',
-      '-b', '$filesDir:/host-files',   // Bind mount filesDir vào guest
+      '-b', '$libDir:/host-libs',   // Bind nativeLibraryDir vào guest
       '-w', '/root',
       ...effectiveCommand,
     ];
@@ -224,8 +204,8 @@ class PRootService {
     // ---- Môi trường ----
     final env = <String, String>{
       'PROOT_TMP_DIR': tmpDir,
-      'PROOT_LOADER': loaderCopy,          // Loader vẫn dùng từ host
-      if (loader32Copy != null) 'PROOT_LOADER_32': loader32Copy,
+      'PROOT_LOADER': loaderPath,
+      if (File(loader32Path).existsSync()) 'PROOT_LOADER_32': loader32Path,
       'LD_LIBRARY_PATH': libDir,
       'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
       'HOME': '/root',
@@ -235,7 +215,7 @@ class PRootService {
     };
 
     _log('🚀 Khởi chạy: $prootBin ${args.join(' ')}');
-    _log('   PROOT_LOADER=$loaderCopy');
+    _log('   PROOT_LOADER=$loaderPath');
 
     final process = await Process.start(
       prootBin,
@@ -244,7 +224,7 @@ class PRootService {
       runInShell: false,
     );
 
-    // Lắng nghe stderr để thấy log verbose của proot
+    // Lắng nghe stderr để xem log verbose
     process.stderr.transform(utf8.decoder).listen((s) {
       _log('[proot] $s');
       onStderr?.call(s);
