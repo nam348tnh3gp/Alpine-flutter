@@ -123,7 +123,6 @@ class PRootService {
 
     final busyboxReal = '$rootfs/bin/busybox';
     if (File(busyboxReal).existsSync()) {
-      // Cấp quyền cho busybox trong rootfs (thuộc filesDir, được phép)
       await Process.run('chmod', ['755', busyboxReal]);
     } else {
       throw Exception('/bin/busybox không tồn tại sau khi giải nén.');
@@ -157,46 +156,57 @@ class PRootService {
       throw Exception('Không tìm thấy libproot.so tại: $prootBin');
     }
 
-    // Loader từ nativeLibraryDir (đã có quyền thực thi từ Android)
-    final loaderPath = '$libDir/libproot-loader.so';
-    final loader32Path = '$libDir/libproot-loader32.so';
-    if (!File(loaderPath).existsSync()) {
-      throw Exception('Không tìm thấy $loaderPath. Cần build lại APK.');
+    // ---- Copy loader và busybox vào filesDir ----
+    final loaderSource = '$libDir/libproot-loader.so';
+    final loaderCopy = '$filesDir/loader';
+    if (!File(loaderSource).existsSync()) {
+      throw Exception('Không tìm thấy loader tại $loaderSource. Cần build lại APK.');
+    }
+    if (await File(loaderCopy).exists()) await File(loaderCopy).delete();
+    await File(loaderSource).copy(loaderCopy);
+    await Process.run('chmod', ['755', loaderCopy]);
+    _log('✅ Copied loader: $loaderCopy');
+
+    final loader32Source = '$libDir/libproot-loader32.so';
+    String? loader32Copy;
+    if (File(loader32Source).existsSync()) {
+      loader32Copy = '$filesDir/loader32';
+      if (await File(loader32Copy).exists()) await File(loader32Copy).delete();
+      await File(loader32Source).copy(loader32Copy);
+      await Process.run('chmod', ['755', loader32Copy]);
+      _log('✅ Copied loader32: $loader32Copy');
     }
 
-    // Tạo symlink trong filesDir để tránh ký tự đặc biệt trong đường dẫn
-    final loaderSymlink = '$filesDir/loader';
-    if (await File(loaderSymlink).exists()) await File(loaderSymlink).delete();
-    await Process.run('ln', ['-sf', loaderPath, loaderSymlink]);
-    _log('ℹ️ Tạo symlink loader: $loaderSymlink -> $loaderPath');
-
-    String? loader32Symlink;
-    if (File(loader32Path).existsSync()) {
-      loader32Symlink = '$filesDir/loader32';
-      if (await File(loader32Symlink).exists()) await File(loader32Symlink).delete();
-      await Process.run('ln', ['-sf', loader32Path, loader32Symlink]);
-      _log('ℹ️ Tạo symlink loader32: $loader32Symlink -> $loader32Path');
+    final busyboxSource = '$libDir/libbusybox.so';
+    final busyboxCopy = '$filesDir/busybox';
+    if (!File(busyboxSource).existsSync()) {
+      throw Exception('Không tìm thấy busybox tại $busyboxSource. Cần build lại APK.');
     }
+    if (await File(busyboxCopy).exists()) await File(busyboxCopy).delete();
+    await File(busyboxSource).copy(busyboxCopy);
+    await Process.run('chmod', ['755', busyboxCopy]);
+    _log('✅ Copied busybox: $busyboxCopy');
 
-    // tmpDir
+    // ---- tmpDir ----
     final tmpDir = '$filesDir/proot-tmp';
     if (await Directory(tmpDir).exists()) {
       await Directory(tmpDir).delete(recursive: true);
     }
     Directory(tmpDir).createSync(recursive: true);
 
-    // Xử lý command: nếu là /bin/sh thì chuyển thành /bin/busybox sh
+    // ---- Xử lý command ----
     if (command.isEmpty) command = ['/bin/sh', '-l'];
     final effectiveCommand = List<String>.from(command);
     if (effectiveCommand.isNotEmpty && effectiveCommand.first == '/bin/sh') {
       effectiveCommand
         ..removeAt(0)
-        ..insertAll(0, ['/bin/busybox', 'sh']);
-      _log('ℹ️ Đổi /bin/sh -> /bin/busybox sh');
+        ..insertAll(0, [busyboxCopy, 'sh']);   // Dùng busybox copy
+      _log('ℹ️ Dùng busybox từ host: $busyboxCopy');
     }
 
-    // Xây dựng args (KHÔNG có --loader)
+    // ---- Args với -v 5 để debug ----
     final args = <String>[
+      '-v', '5',        // verbose để xem loader có được dùng không
       '-0',
       '--link2symlink',
       '--kill-on-exit',
@@ -209,11 +219,11 @@ class PRootService {
       ...effectiveCommand,
     ];
 
-    // Môi trường: chỉ set PROOT_LOADER qua environment
+    // ---- Môi trường ----
     final env = <String, String>{
       'PROOT_TMP_DIR': tmpDir,
-      'PROOT_LOADER': loaderSymlink,      // Quan trọng: dùng symlink
-      if (loader32Symlink != null) 'PROOT_LOADER_32': loader32Symlink,
+      'PROOT_LOADER': loaderCopy,          // Trỏ đến bản copy
+      if (loader32Copy != null) 'PROOT_LOADER_32': loader32Copy,
       'LD_LIBRARY_PATH': libDir,
       'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
       'HOME': '/root',
@@ -223,7 +233,7 @@ class PRootService {
     };
 
     _log('🚀 Khởi chạy: $prootBin ${args.join(' ')}');
-    _log('   PROOT_LOADER=$loaderSymlink');
+    _log('   PROOT_LOADER=$loaderCopy');
 
     final process = await Process.start(
       prootBin,
@@ -232,11 +242,15 @@ class PRootService {
       runInShell: false,
     );
 
-    _currentProcess = process;
+    // Lắng nghe stderr để thấy log verbose của proot
+    process.stderr.transform(utf8.decoder).listen((s) {
+      _log('[proot] $s');
+      onStderr?.call(s);
+    });
     process.stdout.transform(utf8.decoder).listen((s) => onStdout?.call(s));
-    process.stderr.transform(utf8.decoder).listen((s) => onStderr?.call(s));
     process.exitCode.then((code) => _log('Process exited with code $code'));
 
+    _currentProcess = process;
     return process;
   }
 
