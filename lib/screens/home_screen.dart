@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart'; // Thêm cho Clipboard
+import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:xterm/xterm.dart';
 import '../services/proot_service.dart';
@@ -149,8 +149,6 @@ class _HomeScreenState extends State<HomeScreen> {
               child: TerminalView(
                 _terminal,
                 focusNode: _terminalFocusNode,
-                // 🔥 BẬT CHẾ ĐỘ CHỌN VĂN BẢN
-                selectionMode: SelectionMode.on,
               ),
             ),
         ],
