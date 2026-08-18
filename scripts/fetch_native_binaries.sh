@@ -26,17 +26,24 @@ WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 cd "$WORK_DIR"
+
+# 🔥 Chuyển submodule SSH -> HTTPS để tránh lỗi permission
+git config --global url."https://github.com/".insteadOf git@github.com:
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf git@github.com:
+fi
+
 git clone --depth 1 https://github.com/oonid/pr.git proot-builder
 cd proot-builder
 
-# Cần submodule cho talloc
-git submodule update --init
+# 🔥 Update submodule (bao gồm cả submodule lồng nhau)
+git submodule update --init --recursive --depth 1
 
 # Build cho arm64 và arm
 for arch in arm64 arm; do
     echo "[build] Đang build cho $arch ..."
+    # Thử build với --skip-ndk (nếu NDK đã có), nếu fail thì build bình thường (sẽ tải NDK)
     ./scripts/build.sh --arch="$arch" --skip-ndk 2>/dev/null || {
-        # Nếu lần đầu chạy, NDK sẽ được tải; không dùng --skip-ndk
         ./scripts/build.sh --arch="$arch"
     }
 done
