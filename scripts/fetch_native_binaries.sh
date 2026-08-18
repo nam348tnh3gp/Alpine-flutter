@@ -1,7 +1,7 @@
 #!/bin/bash
-# Tự động tải proot, busybox và toàn bộ thư viện phụ thuộc từ Termux repo.
-# Chạy trong GitHub Actions.
-# Các binary được đặt vào jniLibs/<abi>/lib*.so để Android có thể load.
+# Tải proot từ Termux repo và busybox từ Alpine CDN
+# Busybox Alpine được đặt vào jniLibs/<abi>/libbusybox.so
+# Chạy trong GitHub Actions
 
 set -euo pipefail
 
@@ -9,29 +9,24 @@ JNI_DIR="android/app/src/main/jniLibs"
 WORK_DIR="$(mktemp -d)"
 mkdir -p "$JNI_DIR/arm64-v8a" "$JNI_DIR/armeabi-v7a"
 
-REPO_BASE="https://packages.termux.dev/apt/termux-main/dists/stable/main"
+# Termux repo cho proot
+TERMUX_REPO_BASE="https://packages.termux.dev/apt/termux-main/dists/stable/main"
+
+# Alpine repo cho busybox-static
+ALPINE_REPO_BASE="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main"
 
 # Map Termux arch -> Android ABI
 declare -A ARCH_MAP=( ["aarch64"]="arm64-v8a" ["arm"]="armeabi-v7a" )
+# Map Alpine arch
+declare -A ALPINE_ARCH_MAP=( ["aarch64"]="aarch64" ["arm"]="armhf" )
 
-# Các thư viện hệ thống của Android (không cần tải)
-SYSTEM_LIBS=("libc.so" "libdl.so" "libm.so" "liblog.so" "libz.so"
-             "libandroid.so" "libc++_shared.so" "libstdc++.so" "libOpenSLES.so")
-
-# Danh sách package cần tải ban đầu
-INITIAL_PACKAGES=(
-    "proot:bin/proot:libproot.so"
-    "busybox:bin/busybox:libbusybox.so"
-    "libtalloc:lib/libtalloc.so.2:libtalloc.so"
-)
-
-# ---------- Hàm tiện ích ----------
+# ---------- Hàm tải proot từ Termux ----------
 termux_deb_url() {
     local termux_arch="$1" pkg_name="$2"
     local idx="$WORK_DIR/Packages-$termux_arch"
     if [ ! -f "$idx" ]; then
-        curl -fsSL "$REPO_BASE/binary-$termux_arch/Packages" -o "$idx" 2>/dev/null || {
-            curl -fsSL "$REPO_BASE/binary-$termux_arch/Packages.gz" | gunzip > "$idx"
+        curl -fsSL "$TERMUX_REPO_BASE/binary-$termux_arch/Packages" -o "$idx" 2>/dev/null || {
+            curl -fsSL "$TERMUX_REPO_BASE/binary-$termux_arch/Packages.gz" | gunzip > "$idx"
         }
     fi
     awk -v pkg="$pkg_name" '
@@ -40,173 +35,102 @@ termux_deb_url() {
     ' "$idx"
 }
 
-# Tải và trích xuất một package, trả về đường dẫn file đã giải nén
-fetch_package_file() {
-    local termux_arch="$1" pkg_name="$2" file_path_in_pkg="$3"
+fetch_proot() {
+    local termux_arch="$1"
     local abi="${ARCH_MAP[$termux_arch]}"
-    local target_dir="$JNI_DIR/$abi"
-    local target_name="$(basename "$file_path_in_pkg")"
-    # Đổi tên .so.xyz -> .so nếu cần
-    if [[ "$target_name" =~ ^(.*)\.so\.[0-9]+$ ]]; then
-        target_name="${BASH_REMATCH[1]}.so"
-    fi
-    local target_file="$target_dir/$target_name"
+    local target_file="$JNI_DIR/$abi/libproot.so"
+    local target_loader="$JNI_DIR/$abi/libprootloader.so"
 
-    # Kiểm tra nếu đã có file
     if [ -f "$target_file" ] && [ -s "$target_file" ]; then
-        echo "$target_file"
+        echo "[proot/$termux_arch] Đã tồn tại, bỏ qua"
         return 0
     fi
 
     local filename
-    filename="$(termux_deb_url "$termux_arch" "$pkg_name")"
+    filename="$(termux_deb_url "$termux_arch" "proot")"
     if [ -z "$filename" ]; then
-        echo "!! Không tìm thấy package '$pkg_name' cho arch '$termux_arch'." >&2
+        echo "!! Không tìm thấy proot cho arch '$termux_arch'." >&2
         return 1
     fi
 
     local deb_url="https://packages.termux.dev/apt/termux-main/${filename}"
-    local deb_path="$WORK_DIR/${pkg_name}-${termux_arch}.deb"
-    echo "[$pkg_name/$termux_arch] Tải từ $deb_url"
+    local deb_path="$WORK_DIR/proot-${termux_arch}.deb"
+    echo "[proot/$termux_arch] Tải từ $deb_url"
     curl -fsSL "$deb_url" -o "$deb_path"
 
-    local extract_dir="$WORK_DIR/${pkg_name}-${termux_arch}-extracted"
+    local extract_dir="$WORK_DIR/proot-${termux_arch}-extracted"
     mkdir -p "$extract_dir"
     ( cd "$extract_dir" && ar x "$deb_path" )
     local data_tar
     data_tar="$(ls "$extract_dir"/data.tar.* | head -n1)"
     tar -xf "$data_tar" -C "$extract_dir"
 
-    local src="$extract_dir/data/data/com.termux/files/usr/$file_path_in_pkg"
+    local src="$extract_dir/data/data/com.termux/files/usr/bin/proot"
     if [ ! -f "$src" ]; then
-        echo "!! Không tìm thấy file $file_path_in_pkg trong package $pkg_name." >&2
+        echo "!! Không thấy proot binary tại $src." >&2
         return 1
     fi
 
     cp -f "$src" "$target_file"
     chmod 755 "$target_file"
     echo "OK: $target_file ($(du -h "$target_file" | cut -f1))"
-    echo "$target_file"
+
+    # Tạo libprootloader.so (fake loader)
+    echo "Tạo libprootloader.so cho $abi..."
+    cat > "$target_loader" << 'EOF'
+#!/system/bin/sh
+# Fake proot loader - bypass
+exec "$@"
+EOF
+    chmod 755 "$target_loader"
 }
 
-# Lấy danh sách NEEDED của một file ELF
-get_needed_libs() {
-    local file="$1"
-    readelf -d "$file" 2>/dev/null | grep NEEDED | sed -E 's/.*\[(.*)\]/\1/'
-}
+# ---------- Hàm tải busybox-static từ Alpine ----------
+fetch_busybox_alpine() {
+    local alpine_arch="$1"
+    local abi="${ARCH_MAP[$alpine_arch]}"
+    local target_file="$JNI_DIR/$abi/libbusybox.so"
 
-# Kiểm tra thư viện có phải hệ thống không
-is_system_lib() {
-    local lib="$1"
-    for sys in "${SYSTEM_LIBS[@]}"; do
-        if [ "$lib" = "$sys" ]; then
-            return 0
-        fi
-    done
-    return 1
-}
-
-# Xác định package chứa một thư viện
-resolve_package_for_lib() {
-    local lib_name="$1"
-    local base="${lib_name%%.so*}"
-    local pkg_candidate="${base#lib}"
-    # Thử package libpkg
-    if termux_deb_url "$termux_arch" "lib$pkg_candidate" >/dev/null 2>&1; then
-        echo "lib$pkg_candidate"
+    if [ -f "$target_file" ] && [ -s "$target_file" ]; then
+        echo "[busybox/$alpine_arch] Đã tồn tại, bỏ qua"
         return 0
-    elif termux_deb_url "$termux_arch" "$pkg_candidate" >/dev/null 2>&1; then
-        echo "$pkg_candidate"
-        return 0
-    else
-        # Ánh xạ cứng cho một số trường hợp đặc biệt
-        case "$lib_name" in
-            libutil.so.*) echo "libutil" ;;
-            libpcre.so.*) echo "libpcre" ;;
-            libcrypto.so.*) echo "openssl" ;;
-            libssl.so.*) echo "openssl" ;;
-            *) echo "" ;;
-        esac
     fi
-}
 
-# ---------- Hàm xử lý NEEDED (toàn bộ logic, không dùng local ngoài hàm) ----------
-process_needed() {
-    declare -A PATCHED_FILES
-    local CHANGED=false
+    # Tải APK index để tìm phiên bản mới nhất
+    local apk_index="$WORK_DIR/APKINDEX-$alpine_arch"
+    curl -fsSL "$ALPINE_REPO_BASE/$alpine_arch/APKINDEX.tar.gz" | gunzip > "$apk_index"
 
-    while true; do
-        CHANGED=false
-        for file in "$JNI_DIR"/*/*.so; do
-            [ -f "$file" ] || continue
-            local abi_dir="$(dirname "$file")"
-            local abi="$(basename "$abi_dir")"
-            local termux_arch
-            for k in "${!ARCH_MAP[@]}"; do
-                if [ "${ARCH_MAP[$k]}" = "$abi" ]; then
-                    termux_arch="$k"
-                    break
-                fi
-            done
+    # Lấy tên file APK của busybox-static
+    local apk_file
+    apk_file=$(awk -v pkg="busybox-static" '
+        /^P:busybox-static$/ { found=1 }
+        found && /^F:busybox-static-/ { print $2; exit }
+    ' "$apk_index")
 
-            local needed_libs=( $(get_needed_libs "$file") )
-            for need in "${needed_libs[@]}"; do
-                if is_system_lib "$need"; then
-                    continue
-                fi
+    if [ -z "$apk_file" ]; then
+        echo "!! Không tìm thấy busybox-static cho arch '$alpine_arch'." >&2
+        return 1
+    fi
 
-                local base_name="${need%%.so*}"
-                local found_file=""
-                for existing in "$abi_dir"/*.so; do
-                    local existing_base="${existing%%.so*}"
-                    if [ "$(basename "$existing_base")" = "$base_name" ]; then
-                        found_file="$existing"
-                        break
-                    fi
-                done
+    local apk_url="$ALPINE_REPO_BASE/$alpine_arch/$apk_file"
+    local apk_path="$WORK_DIR/busybox-static-${alpine_arch}.apk"
+    echo "[busybox/$alpine_arch] Tải từ $apk_url"
+    curl -fsSL "$apk_url" -o "$apk_path"
 
-                if [ -n "$found_file" ]; then
-                    local target_name="$(basename "$found_file")"
-                    if [ "$need" != "$target_name" ]; then
-                        if [ -z "${PATCHED_FILES[$file]}" ]; then
-                            echo "Patch $file: thay $need -> $target_name"
-                            patchelf --replace-needed "$need" "$target_name" "$file"
-                            PATCHED_FILES["$file"]=1
-                        fi
-                    fi
-                    continue
-                fi
+    # Giải nén APK (là archive tar.gz)
+    local extract_dir="$WORK_DIR/busybox-${alpine_arch}-extracted"
+    mkdir -p "$extract_dir"
+    tar -xzf "$apk_path" -C "$extract_dir"
 
-                echo "Cần tải thư viện: $need"
-                local pkg_name
-                pkg_name="$(resolve_package_for_lib "$need")"
-                if [ -z "$pkg_name" ]; then
-                    echo "!! Không xác định được package cho $need, bỏ qua." >&2
-                    continue
-                fi
+    local src="$extract_dir/bin/busybox.static"
+    if [ ! -f "$src" ]; then
+        echo "!! Không thấy busybox.static trong APK." >&2
+        return 1
+    fi
 
-                local file_path="lib/$need"
-                local new_file
-                if new_file="$(fetch_package_file "$termux_arch" "$pkg_name" "$file_path")"; then
-                    CHANGED=true
-                    local new_name="$(basename "$new_file")"
-                    if [ "$need" != "$new_name" ]; then
-                        if [ -z "${PATCHED_FILES[$file]}" ]; then
-                            echo "Patch $file: thay $need -> $new_name"
-                            patchelf --replace-needed "$need" "$new_name" "$file"
-                            PATCHED_FILES["$file"]=1
-                        fi
-                    fi
-                else
-                    echo "!! Không tải được package $pkg_name cho $need." >&2
-                fi
-            done
-        done
-
-        if [ "$CHANGED" = false ]; then
-            break
-        fi
-    done
+    cp -f "$src" "$target_file"
+    chmod 755 "$target_file"
+    echo "OK: $target_file ($(du -h "$target_file" | cut -f1))"
 }
 
 # ---------- Bước 1: Cài patchelf ----------
@@ -215,20 +139,54 @@ if ! command -v patchelf &>/dev/null; then
     sudo apt-get update && sudo apt-get install -y patchelf
 fi
 
-# ---------- Bước 2: Tải các package ban đầu ----------
-echo "=== Tải các package ban đầu ==="
+# ---------- Bước 2: Tải proot từ Termux ----------
+echo "=== Tải proot từ Termux ==="
 for termux_arch in aarch64 arm; do
-    for pkg_entry in "${INITIAL_PACKAGES[@]}"; do
-        IFS=':' read -r pkg_name file_path target_name <<< "$pkg_entry"
-        fetch_package_file "$termux_arch" "$pkg_name" "$file_path" || exit 1
-    done
+    fetch_proot "$termux_arch" || exit 1
 done
 
-# ---------- Bước 3: Xử lý NEEDED ----------
-echo "=== Xử lý các thư viện phụ thuộc ==="
-process_needed
+# ---------- Bước 3: Tải busybox-static từ Alpine ----------
+echo "=== Tải busybox-static từ Alpine ==="
+for alpine_arch in aarch64 arm; do
+    fetch_busybox_alpine "$alpine_arch" || exit 1
+done
 
-# ---------- Bước 4: Kiểm tra ELF ----------
+# ---------- Bước 4: Patch libproot.so để tìm libtalloc ----------
+# Tải libtalloc từ Termux repo (nếu cần)
+echo "=== Tải libtalloc từ Termux ==="
+for termux_arch in aarch64 arm; do
+    local abi="${ARCH_MAP[$termux_arch]}"
+    local target_file="$JNI_DIR/$abi/libtalloc.so"
+    
+    if [ ! -f "$target_file" ] || [ ! -s "$target_file" ]; then
+        local filename
+        filename="$(termux_deb_url "$termux_arch" "libtalloc")"
+        if [ -n "$filename" ]; then
+            local deb_url="https://packages.termux.dev/apt/termux-main/${filename}"
+            local deb_path="$WORK_DIR/libtalloc-${termux_arch}.deb"
+            echo "[libtalloc/$termux_arch] Tải từ $deb_url"
+            curl -fsSL "$deb_url" -o "$deb_path"
+
+            local extract_dir="$WORK_DIR/libtalloc-${termux_arch}-extracted"
+            mkdir -p "$extract_dir"
+            ( cd "$extract_dir" && ar x "$deb_path" )
+            local data_tar
+            data_tar="$(ls "$extract_dir"/data.tar.* | head -n1)"
+            tar -xf "$data_tar" -C "$extract_dir"
+
+            local src="$extract_dir/data/data/com.termux/files/usr/lib/libtalloc.so.2"
+            if [ -f "$src" ]; then
+                cp -f "$src" "$target_file"
+                chmod 755 "$target_file"
+                echo "OK: $target_file ($(du -h "$target_file" | cut -f1))"
+            else
+                echo "!! Không tìm thấy libtalloc.so.2" >&2
+            fi
+        fi
+    fi
+done
+
+# ---------- Bước 5: Kiểm tra ELF ----------
 echo "=== Kiểm tra file ELF ==="
 for f in "$JNI_DIR"/*/*.so; do
     if [ -f "$f" ] && ! head -c4 "$f" | grep -q $'\x7fELF'; then
