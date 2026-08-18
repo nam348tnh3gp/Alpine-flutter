@@ -263,6 +263,111 @@ for termux_arch in aarch64 arm; do
     fetch_busybox_alpine "$termux_arch" || exit 1
 done
 
+echo "=== Quét đệ quy NEEDED của TẤT CẢ file .so đã tải (không chỉ libproot) ==="
+# Cho tới lúc này mới chỉ biết libproot.so cần libtalloc.so + libandroid-shmem.so.
+# Nhưng bản thân libtalloc.so / libandroid-shmem.so có thể lại cần thêm lib
+# khác (đệ quy nhiều tầng). Bước này quét NEEDED của MỌI file .so hiện có
+# trong jniLibs, lặp lại nhiều lượt cho tới khi không phát sinh thêm gì mới.
+
+# Thư viện chắc chắn có sẵn trên mọi Android (Bionic hệ thống) - không cần bundle.
+SYSTEM_LIBS_WHITELIST=" libc.so libm.so libdl.so liblog.so "
+
+# Map: tên .so được NEEDED tới -> tên package Termux cung cấp nó.
+# Mở rộng bảng này nếu log báo "CẢNH BÁO" phát hiện lib lạ chưa map.
+declare -A SO_TO_TERMUX_PKG=(
+    ["libtalloc.so"]="libtalloc"
+    ["libandroid-shmem.so"]="libandroid-shmem"
+)
+
+# Tải 1 package Termux tổng quát, tìm bất kỳ file .so nào khớp $so_glob bên
+# trong, copy ra $target_name, rồi patch lại NEEDED trên MỌI file .so khác
+# trong cùng abi có tham chiếu tên cũ (có version) sang tên mới.
+fetch_termux_lib_generic() {
+    local termux_arch="$1" pkg_name="$2" so_glob="$3" abi="$4" target_name="$5"
+    local target_file="$JNI_DIR/$abi/$target_name"
+
+    local filename
+    filename="$(termux_deb_url "$termux_arch" "$pkg_name")"
+    if [ -z "$filename" ]; then
+        echo "!! Không tìm thấy package Termux '$pkg_name' cho '$termux_arch'." >&2
+        return 1
+    fi
+
+    local deb_url="https://packages.termux.dev/apt/termux-main/${filename}"
+    local deb_path="$WORK_DIR/${pkg_name}-${termux_arch}.deb"
+    echo "[transitive/$abi] Tải '$pkg_name' <- $deb_url"
+    curl -fsSL "$deb_url" -o "$deb_path"
+
+    local extract_dir="$WORK_DIR/${pkg_name}-${termux_arch}-extracted"
+    termux_extract_deb "$deb_path" "$extract_dir"
+
+    local src
+    src="$(find "$extract_dir/data/data/com.termux/files/usr/lib" -iname "$so_glob" -type f | head -n1)"
+    if [ -z "$src" ] || [ ! -f "$src" ]; then
+        echo "!! Gói '$pkg_name' không chứa file khớp '$so_glob'." >&2
+        return 1
+    fi
+
+    cp -f "$src" "$target_file"
+    chmod 755 "$target_file"
+    echo "OK: $target_file ($(du -h "$target_file" | cut -f1))"
+
+    # Nếu tên file gốc trong gói có version (vd libfoo.so.3) khác với
+    # target_name (vd libfoo.so), sửa lại NEEDED trên mọi consumer khác.
+    local real_soname
+    real_soname="$(patchelf --print-soname "$target_file" 2>/dev/null || basename "$src")"
+    if [ -n "$real_soname" ] && [ "$real_soname" != "$target_name" ]; then
+        for consumer in "$JNI_DIR/$abi"/*.so; do
+            [ -f "$consumer" ] || continue
+            if patchelf --print-needed "$consumer" 2>/dev/null | grep -qx "$real_soname"; then
+                echo "[transitive/$abi] Đổi NEEDED trong $(basename "$consumer"): '$real_soname' -> '$target_name'"
+                patchelf --replace-needed "$real_soname" "$target_name" "$consumer"
+            fi
+        done
+    fi
+}
+
+resolve_transitive_needed() {
+    local abi="$1" termux_arch="$2"
+    local pass=0 changed=1
+    while [ "$changed" -eq 1 ] && [ "$pass" -lt 6 ]; do
+        changed=0
+        pass=$((pass + 1))
+        echo "[transitive/$abi] --- lượt quét $pass ---"
+        for f in "$JNI_DIR/$abi"/*.so; do
+            [ -f "$f" ] || continue
+            local needed_list
+            needed_list="$(patchelf --print-needed "$f" 2>/dev/null || true)"
+            while IFS= read -r needed; do
+                [ -z "$needed" ] && continue
+                case "$SYSTEM_LIBS_WHITELIST" in
+                    *" $needed "*) continue ;;
+                esac
+                if [ -f "$JNI_DIR/$abi/$needed" ]; then
+                    continue
+                fi
+                local pkg="${SO_TO_TERMUX_PKG[$needed]:-}"
+                if [ -n "$pkg" ]; then
+                    echo "[transitive/$abi] $(basename "$f") cần '$needed' (chưa có) -> tải qua package '$pkg'"
+                    fetch_termux_lib_generic "$termux_arch" "$pkg" "${needed%.so*}*.so*" "$abi" "$needed" \
+                        && changed=1
+                else
+                    echo "!! CẢNH BÁO [transitive/$abi]: $(basename "$f") cần '$needed' nhưng KHÔNG có trong bảng SO_TO_TERMUX_PKG." >&2
+                    echo "   -> Chưa tự tải được. Nếu proot/lib liên quan crash lúc chạy với lỗi" >&2
+                    echo "      'cannot open shared object file: $needed', hãy thêm mapping cho nó" >&2
+                    echo "      vào SO_TO_TERMUX_PKG trong scripts/fetch_native_binaries.sh" >&2
+                fi
+            done <<< "$needed_list"
+        done
+    done
+    if [ "$pass" -ge 6 ] && [ "$changed" -eq 1 ]; then
+        echo "!! CẢNH BÁO [transitive/$abi]: quét đủ 6 lượt vẫn còn thay đổi - có thể có vòng lặp phụ thuộc bất thường, kiểm tra thủ công." >&2
+    fi
+}
+
+resolve_transitive_needed "arm64-v8a" "aarch64"
+resolve_transitive_needed "armeabi-v7a" "arm"
+
 echo "=== Kiểm tra file ELF ==="
 for f in "$JNI_DIR"/*/*.so; do
     [ -f "$f" ] || continue
