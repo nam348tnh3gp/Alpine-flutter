@@ -5,116 +5,12 @@ import 'package:archive/archive_io.dart';
 import 'package:http/http.dart' as http;
 import 'native_bridge.dart';
 
-/// Client tương tác với Docker Registry OCI (giống proot-distro)
-class DockerRegistryClient {
-  static const String registry = 'registry-1.docker.io';
-  static const String authService = 'registry.docker.io';
-
-  final String image; // 'library/alpine'
-
-  DockerRegistryClient(this.image);
-
-  /// Lấy token xác thực (anonymous)
-  Future<String> _getToken(String scope) async {
-    final url = Uri.parse(
-        'https://auth.docker.io/token?service=$authService&scope=repository:$image:pull');
-    final response = await http.get(url);
-    if (response.statusCode != 200) {
-      throw Exception('Không lấy được token: ${response.body}');
-    }
-    final json = jsonDecode(response.body);
-    return json['token'];
-  }
-
-  /// Lấy manifest cho tag, tự động chọn đúng kiến trúc
-  Future<Map<String, dynamic>> getManifest(String tag, String arch) async {
-    final token = await _getToken('repository:$image:pull');
-
-    // Lấy manifest list (multi-arch)
-    final listUrl = Uri.parse('https://$registry/v2/$image/manifests/$tag');
-    final listResp = await http.get(listUrl, headers: {
-      'Authorization': 'Bearer $token',
-      'Accept': 'application/vnd.docker.distribution.manifest.list.v2+json',
-    });
-    if (listResp.statusCode != 200) {
-      // Nếu không có manifest list, thử lấy manifest thường
-      return _fetchManifest(token, tag);
-    }
-
-    final listJson = jsonDecode(listResp.body);
-    final manifests = listJson['manifests'] as List;
-    // Tìm manifest phù hợp với kiến trúc
-    Map<String, dynamic>? selected;
-    for (var m in manifests) {
-      final platform = m['platform'] as Map<String, dynamic>;
-      if (platform['architecture'] == arch) {
-        selected = m;
-        break;
-      }
-    }
-    if (selected == null) {
-      throw Exception('Không tìm thấy manifest cho kiến trúc $arch');
-    }
-
-    final digest = selected['digest'];
-    // Tải manifest cụ thể
-    return _fetchManifest(token, digest);
-  }
-
-  Future<Map<String, dynamic>> _fetchManifest(String token, String ref) async {
-    final url = Uri.parse('https://$registry/v2/$image/manifests/$ref');
-    final response = await http.get(url, headers: {
-      'Authorization': 'Bearer $token',
-      'Accept': 'application/vnd.docker.distribution.manifest.v2+json',
-    });
-    if (response.statusCode != 200) {
-      throw Exception('Lỗi tải manifest: ${response.body}');
-    }
-    return jsonDecode(response.body);
-  }
-
-  /// Tải blob (layer) dưới dạng bytes
-  Future<List<int>> downloadBlob(String digest) async {
-    final token = await _getToken('repository:$image:pull');
-    final url = Uri.parse('https://$registry/v2/$image/blobs/$digest');
-    final response = await http.get(url, headers: {
-      'Authorization': 'Bearer $token',
-    });
-    if (response.statusCode != 200) {
-      throw Exception('Lỗi tải blob: ${response.body}');
-    }
-    return response.bodyBytes;
-  }
-}
-
-/// Hàm tiện ích giải nén tar.gz hoặc tar
-void extractTarGz(List<int> bytes, String targetDir) {
-  // Kiểm tra nếu là gzip (magic bytes 1F 8B)
-  bool isGzip = bytes.length >= 2 && bytes[0] == 0x1F && bytes[1] == 0x8B;
-  List<int> data = bytes;
-  if (isGzip) {
-    data = GZipDecoder().decodeBytes(bytes);
-  }
-  final archive = TarDecoder().decodeBytes(data);
-  for (final file in archive) {
-    final outPath = '$targetDir/${file.name}';
-    if (file.isFile) {
-      final outFile = File(outPath);
-      outFile.parent.createSync(recursive: true);
-      outFile.writeAsBytesSync(file.content as List<int>);
-    } else {
-      Directory(outPath).createSync(recursive: true);
-    }
-  }
-}
-
 class PRootService {
-  static const _alpineImage = 'library/alpine';
-  static const _alpineTag = '3.19'; // có thể thay đổi
-
-  static const _archMap = {
+  static const _alpineVersion = '3.19.9';
+  
+  static const _alpineArchMap = {
     'arm64-v8a': 'aarch64',
-    'armeabi-v7a': 'arm',
+    'armeabi-v7a': 'armv7',
   };
 
   final void Function(String line) onLog;
@@ -129,57 +25,98 @@ class PRootService {
 
   Future<bool> isInstalled() async {
     final rootfs = await _rootfsDir();
-    // Kiểm tra file đặc trưng của Alpine
     return File('$rootfs/etc/alpine-release').existsSync();
   }
 
   Future<void> bootstrap({required void Function(double) onProgress}) async {
     final abi = await NativeBridge.getAbi();
-    final dockerArch = _archMap[abi] ?? 'aarch64';
+    final alpineArch = _alpineArchMap[abi] ?? 'aarch64';
     final rootfs = await _rootfsDir();
     final filesDir = await NativeBridge.getFilesDir();
 
-    // Xóa rootfs cũ nếu có
+    // Xóa rootfs cũ
     if (await Directory(rootfs).exists()) {
       await Directory(rootfs).delete(recursive: true);
     }
     Directory(rootfs).createSync(recursive: true);
 
-    onLog('🔄 Tải Alpine $dockerArch từ Docker registry...');
+    // 🔥 DÙNG MINIROOTFS (nhẹ ~3MB)
+    final url = 'https://dl-cdn.alpinelinux.org/alpine/v${_alpineVersion.substring(0, 4)}/'
+        'releases/$alpineArch/alpine-minirootfs-$_alpineVersion-$alpineArch.tar.gz';
 
-    final client = DockerRegistryClient(_alpineImage);
-    final manifest = await client.getManifest(_alpineTag, dockerArch);
-    final layers = manifest['layers'] as List;
+    onLog('Đang tải Alpine minirootfs ($alpineArch)...\n$url');
 
-    int total = layers.length;
-    int current = 0;
+    final tarGzPath = '$filesDir/alpine-rootfs.tar.gz';
+    final request = http.Request('GET', Uri.parse(url));
+    final response = await http.Client().send(request);
 
-    for (var layer in layers) {
-      final digest = layer['digest'];
-      onLog('📥 Tải layer ${++current}/$total: $digest');
-      final blobBytes = await client.downloadBlob(digest);
-      onLog('📦 Giải nén layer...');
-      extractTarGz(blobBytes, rootfs);
-      onProgress(current / total);
+    if (response.statusCode != 200) {
+      throw Exception('Tải rootfs thất bại: HTTP ${response.statusCode}. '
+          'Kiểm tra lại URL/version Alpine trong proot_service.dart');
     }
 
-    // Tạo các thư mục runtime cần thiết
+    final total = response.contentLength ?? 0;
+    var received = 0;
+    final sink = File(tarGzPath).openWrite();
+    await for (final chunk in response.stream) {
+      sink.add(chunk);
+      received += chunk.length;
+      if (total > 0) onProgress(received / total);
+    }
+    await sink.close();
+
+    onLog('Giải nén rootfs...');
+    final bytes = File(tarGzPath).readAsBytesSync();
+    final archive = TarDecoder().decodeBytes(GZipDecoder().decodeBytes(bytes));
+    
+    for (final file in archive) {
+      final outPath = '$rootfs/${file.name}';
+      if (file.isFile) {
+        final outFile = File(outPath);
+        outFile.parent.createSync(recursive: true);
+        outFile.writeAsBytesSync(file.content as List<int>);
+      } else {
+        Directory(outPath).createSync(recursive: true);
+      }
+    }
+    File(tarGzPath).deleteSync();
+
+    // 🔥 Tạo /bin/sh từ libbusybox.so đã nhúng trong APK
+    final libDir = await NativeBridge.getNativeLibraryDir();
+    final busyboxSrc = '$libDir/libbusybox.so';
+    final busyboxDst = '$rootfs/bin/busybox';
+    final shPath = '$rootfs/bin/sh';
+
+    if (File(busyboxSrc).existsSync()) {
+      onLog('📦 Copy libbusybox.so vào rootfs...');
+      await File(busyboxSrc).copy(busyboxDst);
+      await File(busyboxDst).setMode(FileMode.ownerExecute);
+      
+      // Tạo symlink /bin/sh -> busybox
+      onLog('🔗 Tạo symlink /bin/sh -> busybox');
+      try {
+        await Process.run('ln', ['-sf', '/bin/busybox', shPath]);
+      } catch (e) {
+        // Nếu không tạo symlink được, copy busybox thành sh
+        onLog('Không thể tạo symlink, copy busybox thành sh');
+        final shFile = File(shPath);
+        await shFile.writeAsBytes(File(busyboxDst).readAsBytesSync());
+        await shFile.setMode(FileMode.ownerExecute);
+      }
+      onLog('✅ Shell /bin/sh đã sẵn sàng!');
+    } else {
+      onLog('⚠️ Không tìm thấy libbusybox.so trong native libs!');
+    }
+
+    // Tạo thư mục runtime cho proot
     for (final d in ['proc', 'sys', 'dev', 'tmp', 'root']) {
       Directory('$rootfs/$d').createSync(recursive: true);
     }
 
-    // Cấu hình DNS (giống proot-distro)
-    final resolvConf = File('$rootfs/etc/resolv.conf');
-    resolvConf.writeAsStringSync('nameserver 8.8.8.8\nnameserver 1.1.1.1\n');
+    // DNS
+    File('$rootfs/etc/resolv.conf').writeAsStringSync('nameserver 8.8.8.8\nnameserver 1.1.1.1\n');
 
-    // Cấu hình hosts
-    final hosts = File('$rootfs/etc/hosts');
-    hosts.writeAsStringSync('127.0.0.1 localhost\n::1 localhost ip6-localhost\n');
-
-    // Đánh dấu đã cài
-    File('$rootfs/.installed').createSync();
-
-    onLog('✅ Cài đặt Alpine hoàn tất tại $rootfs');
+    onLog('✅ Hoàn tất cài đặt Alpine rootfs tại: $rootfs');
   }
 
   Future<Process> start({
@@ -195,7 +132,6 @@ class PRootService {
     final tmpDir = '$filesDir/proot-tmp';
     Directory(tmpDir).createSync(recursive: true);
 
-    // Mặc định shell nếu không có command
     if (command.isEmpty) {
       command = ['/bin/sh', '-l'];
     }
@@ -221,6 +157,7 @@ class PRootService {
       environment: {
         'PROOT_TMP_DIR': tmpDir,
         'PROOT_LOADER': '$libDir/libprootloader.so',
+        'LD_LIBRARY_PATH': '/host-libs',
         'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
         'HOME': '/root',
         'TERM': 'xterm-256color',
