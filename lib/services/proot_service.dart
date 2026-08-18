@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'native_bridge.dart';
+import 'package:flutter/services.dart'; // Thêm để copy
 
 class PRootService {
   static const _alpineVersion = '3.19.9';
@@ -14,6 +15,10 @@ class PRootService {
 
   final void Function(String line) onLog;
   Process? _currentProcess;
+  
+  // 🔥 Thêm buffer để lưu log
+  StringBuffer _logBuffer = StringBuffer();
+  bool _logEnabled = true;
 
   PRootService({required this.onLog});
 
@@ -42,7 +47,7 @@ class PRootService {
     final url = 'https://dl-cdn.alpinelinux.org/alpine/v${_alpineVersion.substring(0, 4)}/'
         'releases/$alpineArch/alpine-minirootfs-$_alpineVersion-$alpineArch.tar.gz';
 
-    onLog('Đang tải Alpine minirootfs ($alpineArch)...\n$url');
+    _log('Đang tải Alpine minirootfs ($alpineArch)...\n$url');
 
     final tarGzPath = '$filesDir/alpine-rootfs.tar.gz';
     final request = http.Request('GET', Uri.parse(url));
@@ -64,7 +69,7 @@ class PRootService {
     await sink.close();
 
     final busyboxSrc = '$libDir/libbusybox.so';
-    onLog('📦 Kiểm tra libbusybox.so tại: $busyboxSrc');
+    _log('📦 Kiểm tra libbusybox.so tại: $busyboxSrc');
 
     if (!File(busyboxSrc).existsSync()) {
       final altPaths = [
@@ -81,7 +86,7 @@ class PRootService {
       }
 
       if (foundPath != null) {
-        onLog('✅ Tìm thấy libbusybox.so tại: $foundPath');
+        _log('✅ Tìm thấy libbusybox.so tại: $foundPath');
         await File(foundPath).copy(busyboxSrc);
         await _chmodX(busyboxSrc);
       } else {
@@ -94,21 +99,18 @@ class PRootService {
     }
 
     // 🔥 CÁCH 2: Tạo symlink để gọi busybox đúng cách
-    // Tạo thư mục tạm để chứa các symlink
     final tempBinDir = Directory('$filesDir/busybox-bin');
     if (await tempBinDir.exists()) {
       await tempBinDir.delete(recursive: true);
     }
     await tempBinDir.create(recursive: true);
 
-    // Tạo symlink 'tar' trỏ đến libbusybox.so
     final tarLink = File('${tempBinDir.path}/tar');
     await Process.run('ln', ['-sf', busyboxSrc, tarLink.path]);
 
-    onLog('✅ Đã tạo symlink tar -> busybox');
+    _log('✅ Đã tạo symlink tar -> busybox');
 
-    // 🔥 GIẢI NÉN BẰNG BUSYBOX QUA SYMLINK
-    onLog('Giải nén rootfs bằng busybox tar (qua symlink)...');
+    _log('Giải nén rootfs bằng busybox tar (qua symlink)...');
     onProgress(0.87);
 
     final result = await Process.run(
@@ -121,14 +123,13 @@ class PRootService {
     );
 
     if (result.exitCode != 0) {
-      onLog('❌ Lỗi giải nén: exitCode=${result.exitCode}');
-      onLog('stderr: ${result.stderr}');
-      onLog('stdout: ${result.stdout}');
+      _log('❌ Lỗi giải nén: exitCode=${result.exitCode}');
+      _log('stderr: ${result.stderr}');
+      _log('stdout: ${result.stdout}');
 
-      // Thử với host tar nếu busybox thất bại
       final hostTar = '/system/bin/tar';
       if (File(hostTar).existsSync()) {
-        onLog('🔄 Thử giải nén bằng host tar...');
+        _log('🔄 Thử giải nén bằng host tar...');
         final result2 = await Process.run(
           hostTar,
           ['-xzf', tarGzPath, '-C', rootfs],
@@ -139,7 +140,6 @@ class PRootService {
             'busybox: ${result.stderr}, host tar: ${result2.stderr}',
           );
         }
-        // Nếu host tar thành công, xóa file rỗng từ busybox
         await File('$rootfs/usr').delete(recursive: true).catchError((_) {});
       } else {
         throw Exception(
@@ -149,65 +149,77 @@ class PRootService {
       }
     }
 
-    // Xóa thư mục tạm busybox-bin
     await tempBinDir.delete(recursive: true).catchError((_) {});
 
     onProgress(0.95);
     await File(tarGzPath).delete().catchError((_) => File(tarGzPath));
 
-    // Tạo thư mục runtime cho proot
     for (final d in ['proc', 'sys', 'dev', 'tmp', 'root']) {
       Directory('$rootfs/$d').createSync(recursive: true);
     }
 
-    // DNS
     File('$rootfs/etc/resolv.conf')
         .writeAsStringSync('nameserver 8.8.8.8\nnameserver 1.1.1.1\n');
 
-    // 🔥 KIỂM TRA VÀ TẠO /bin/sh
     final shPath = '$rootfs/bin/sh';
     if (!File(shPath).existsSync()) {
-      onLog('⚠️ /bin/sh không tồn tại! Tạo từ busybox...');
+      _log('⚠️ /bin/sh không tồn tại! Tạo từ busybox...');
       await File(busyboxSrc).copy('$rootfs/bin/busybox');
       await _chmodX('$rootfs/bin/busybox');
       
-      // Tạo symlink /bin/sh -> busybox
       try {
         await Process.run('ln', ['-sf', '/bin/busybox', shPath]);
-        onLog('✅ Đã tạo symlink /bin/sh -> busybox');
+        _log('✅ Đã tạo symlink /bin/sh -> busybox');
       } catch (e) {
-        // Fallback: copy busybox thành sh
-        onLog('⚠️ Không tạo được symlink, copy busybox thành sh');
+        _log('⚠️ Không tạo được symlink, copy busybox thành sh');
         await File(busyboxSrc).copy(shPath);
         await _chmodX(shPath);
       }
     } else {
-      onLog('✅ /bin/sh đã tồn tại');
+      _log('✅ /bin/sh đã tồn tại');
     }
 
-    // 🔥 KIỂM TRA THÊM
     if (File('$rootfs/bin/sh').existsSync()) {
-      onLog('✅ Shell đã sẵn sàng!');
+      _log('✅ Shell đã sẵn sàng!');
     } else {
-      onLog('❌ VẪN CHƯA CÓ /bin/sh! Kiểm tra lại.');
-      // Liệt kê nội dung /bin để debug
+      _log('❌ VẪN CHƯA CÓ /bin/sh! Kiểm tra lại.');
       try {
         final lsResult = await Process.run('ls', ['-la', '$rootfs/bin']);
-        onLog('Nội dung /bin:\n${lsResult.stdout}');
+        _log('Nội dung /bin:\n${lsResult.stdout}');
       } catch (_) {}
     }
 
     onProgress(1.0);
-    onLog('✅ Hoàn tất cài đặt Alpine rootfs tại: $rootfs');
+    _log('✅ Hoàn tất cài đặt Alpine rootfs tại: $rootfs');
   }
 
   Future<void> _chmodX(String path) async {
     try {
       await Process.run('chmod', ['+x', path]);
     } catch (_) {
-      // Fallback: dùng chmod 755
       await Process.run('chmod', ['755', path]);
     }
+  }
+
+  // 🔥 HÀM LOG với buffer để copy
+  void _log(String message) {
+    _logBuffer.writeln(message);
+    onLog(message);
+  }
+
+  // 🔥 Lấy toàn bộ log để copy
+  String getLogs() {
+    return _logBuffer.toString();
+  }
+
+  // 🔥 Xóa log
+  void clearLogs() {
+    _logBuffer.clear();
+  }
+
+  // 🔥 Bật/tắt log
+  void setLogEnabled(bool enabled) {
+    _logEnabled = enabled;
   }
 
   Future<Process> start({
@@ -221,7 +233,6 @@ class PRootService {
 
     final prootBin = '$libDir/libproot.so';
 
-    // Kiểm tra proot tồn tại
     if (!File(prootBin).existsSync()) {
       throw Exception('Không tìm thấy libproot.so tại: $prootBin');
     }
@@ -236,15 +247,13 @@ class PRootService {
       command = ['/bin/sh', '-l'];
     }
 
-    // Kiểm tra shell
     final shPath = '$rootfs/bin/sh';
     if (!File(shPath).existsSync()) {
-      onLog('⚠️ /bin/sh không tồn tại! Thử dùng busybox...');
-      // Thử dùng busybox trực tiếp
+      _log('⚠️ /bin/sh không tồn tại! Thử dùng busybox...');
       final busyboxHost = '$libDir/libbusybox.so';
       if (File(busyboxHost).existsSync()) {
         command = ['/host-libs/libbusybox.so', 'sh', '-l'];
-        onLog('🔄 Chuyển sang dùng busybox từ host');
+        _log('🔄 Chuyển sang dùng busybox từ host');
       } else {
         throw Exception(
           'Không tìm thấy shell: $shPath. '
@@ -267,7 +276,7 @@ class PRootService {
       ...command,
     ];
 
-    onLog('🚀 Khởi chạy: $prootBin ${args.join(' ')}');
+    _log('🚀 Khởi chạy: $prootBin ${args.join(' ')}');
 
     final process = await Process.start(
       prootBin,
@@ -278,6 +287,9 @@ class PRootService {
         'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/host-libs',
         'HOME': '/root',
         'TERM': 'xterm-256color',
+        // 🔥 Resize terminal cho giống Termux
+        'COLUMNS': '80',
+        'LINES': '24',
       },
       runInShell: false,
     );
@@ -293,10 +305,19 @@ class PRootService {
     });
 
     process.exitCode.then((code) {
-      onLog('Process exited with code $code');
+      _log('Process exited with code $code');
     });
 
     return process;
+  }
+
+  // 🔥 HÀM RESIZE TERMINAL (gọi từ UI khi kích thước thay đổi)
+  void resizeTerminal(int columns, int lines) {
+    if (_currentProcess != null) {
+      // Gửi tín hiệu SIGWINCH để process biết terminal đã resize
+      _currentProcess!.kill(ProcessSignal.sigwinch);
+      _log('📐 Terminal resized to ${columns}x${lines}');
+    }
   }
 
   void stop() {
