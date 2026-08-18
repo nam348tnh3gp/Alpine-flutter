@@ -5,13 +5,6 @@ import 'package:tar/tar.dart';
 import 'package:http/http.dart' as http;
 import 'native_bridge.dart';
 
-/// Quản lý bootstrap Alpine rootfs + chạy proot. KHÔNG exec bất kỳ native
-/// binary nào (tar/busybox...) trực tiếp trên host để giải nén - Android áp
-/// seccomp-bpf cho tiến trình app, nhiều syscall mà tar/musl dùng bị chặn,
-/// gây crash SIGSYS (exitCode âm, vd -31) ngay cả khi binary hợp lệ và có
-/// quyền exec. Giải nén bằng package:tar thuần Dart (không qua syscall lạ
-/// nào ngoài file I/O thông thường), có hỗ trợ symlink đầy đủ và đáng tin
-/// cậy hơn package:archive (từng thiếu xử lý symlink cho định dạng TAR).
 class PRootService {
   static const _alpineVersion = '3.19.9';
 
@@ -37,13 +30,6 @@ class PRootService {
   Future<String> _rootfsDir() async {
     final filesDir = await NativeBridge.getFilesDir();
     return '$filesDir/alpine-rootfs';
-  }
-
-  Future<void> _chmodExecutable(String path) async {
-    final result = await Process.run('chmod', ['755', path]);
-    if (result.exitCode != 0) {
-      throw Exception('chmod thất bại cho $path: ${result.stderr}');
-    }
   }
 
   Future<bool> isInstalled() async {
@@ -143,7 +129,9 @@ class PRootService {
 
     final busyboxReal = '$rootfs/bin/busybox';
     if (File(busyboxReal).existsSync()) {
-      await _chmodExecutable(busyboxReal);
+      // Không cần chmod vì file này nằm trong rootfs (thuộc filesDir) - nên có thể chmod
+      // Nhưng tốt nhất là không cần vì tar đã giữ quyền, nhưng để chắc chắn vẫn làm
+      await Process.run('chmod', ['755', busyboxReal]);
     } else {
       throw Exception('/bin/busybox không tồn tại sau khi giải nén - '
           'tar.gz tải về có thể bị hỏng/thiếu. Thử tải lại.');
@@ -180,7 +168,7 @@ class PRootService {
       throw Exception('Không tìm thấy libproot.so tại: $prootBin');
     }
 
-    // ---- Tạo symlink sạch cho loader trong filesDir (cách 2) ----
+    // ---- Loader từ nativeLibraryDir (không cần chmod) ----
     final loaderPath = '$libDir/libproot-loader.so';
     final loader32Path = '$libDir/libproot-loader32.so';
     if (!File(loaderPath).existsSync()) {
@@ -191,12 +179,7 @@ class PRootService {
       );
     }
 
-    // Cấp quyền thực thi cho loader (dù đã có nhưng đảm bảo)
-    await _chmodExecutable(loaderPath);
-    if (File(loader32Path).existsSync()) {
-      await _chmodExecutable(loader32Path);
-    }
-
+    // ---- Tạo symlink trong filesDir để tránh đường dẫn dài (không cần chmod) ----
     final loaderSymlink = '$filesDir/loader';
     if (await File(loaderSymlink).exists()) {
       await File(loaderSymlink).delete();
@@ -233,12 +216,12 @@ class PRootService {
       _log('ℹ️ Đổi lệnh khởi chạy: /bin/sh -> /bin/busybox sh (không cần symlink)');
     }
 
-    // ---- Xây dựng args (cách 1: thêm --loader) ----
+    // ---- Xây dựng args với --loader ----
     final args = <String>[
       '-0',
       '--link2symlink',
       '--kill-on-exit',
-      '--loader', loaderSymlink,          // <-- Thêm flag loader (cách 1)
+      '--loader', loaderSymlink,
       if (loader32Symlink != null) ...['--loader32', loader32Symlink],
       '-r', rootfs,
       '-b', '/dev',
@@ -252,7 +235,7 @@ class PRootService {
     // ---- Môi trường ----
     final env = <String, String>{
       'PROOT_TMP_DIR': tmpDir,
-      'PROOT_LOADER': loaderSymlink,      // Vẫn giữ để an toàn
+      'PROOT_LOADER': loaderSymlink,
       if (loader32Symlink != null) 'PROOT_LOADER_32': loader32Symlink,
       'LD_LIBRARY_PATH': libDir,
       'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
