@@ -1,7 +1,6 @@
 #!/bin/bash
-# Tự build proot + loader từ source (oonid/pr) - chỉ lấy những phần cần thiết.
+# Tự build proot + loader từ source (oonid/pr) và tải busybox-static từ Alpine.
 # Đặt vào jniLibs/<abi>/lib*.so để lách W^X.
-# Chạy trong GitHub Actions.
 
 set -euo pipefail
 
@@ -36,8 +35,12 @@ fi
 git clone --depth 1 https://github.com/oonid/pr.git proot-builder
 cd proot-builder
 
-# 🔥 Chỉ update 2 submodule cần thiết: vendor/proot và vendor/samba
+# 🔥 Chỉ update 2 submodule cần thiết
 git submodule update --init vendor/proot vendor/samba
+
+# 🔥 Patch build.sh để build loader trước proot
+# Tìm dòng "GIT=true \" và thêm "        loader \" ngay sau đó
+sed -i '/GIT=true \\/a\        loader \\' scripts/build.sh
 
 # Build cho arm64 và arm
 for arch in arm64 arm; do
