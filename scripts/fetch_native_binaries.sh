@@ -1,5 +1,5 @@
 #!/bin/bash
-# Tự build proot + loader từ source (oonid/pr) và tải busybox-static từ Alpine.
+# Build proot + loader từ oonid/pr (đã patch cho Android)
 # Đặt vào jniLibs/<abi>/lib*.so để lách W^X.
 # Chạy trong GitHub Actions.
 
@@ -7,9 +7,6 @@ set -euo pipefail
 
 JNI_DIR="android/app/src/main/jniLibs"
 mkdir -p "$JNI_DIR/arm64-v8a" "$JNI_DIR/armeabi-v7a"
-
-ALPINE_REPO_BASE="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main"
-declare -A ALPINE_ARCH_MAP=( ["arm64-v8a"]="aarch64" ["armeabi-v7a"]="armhf" )
 
 # ---- Kiểm tra công cụ ----
 for cmd in git make python3 curl unzip; do
@@ -36,11 +33,11 @@ fi
 git clone --depth 1 https://github.com/oonid/pr.git proot-builder
 cd proot-builder
 
-# Chỉ update 2 submodule cần thiết (proot và samba cho talloc)
+# 🔥 Chỉ cần 2 submodule: vendor/proot và vendor/samba (cho libtalloc)
 git submodule update --init vendor/proot vendor/samba
 
 # 🔥 Build cả arm64 và arm bằng script có sẵn
-# KHÔNG patch, KHÔNG sed, KHÔNG thêm bất cứ thứ gì
+# Script tự tải NDK, build libtalloc.a, build proot và loader, fix TLS alignment
 echo "[build] Build cho arm64 và arm..."
 ./scripts/build.sh --arch=all
 
@@ -59,6 +56,9 @@ echo "✅ Build proot + loader hoàn tất"
 
 # ---- Tải busybox-static từ Alpine ----
 echo "=== Tải busybox-static từ Alpine ==="
+
+ALPINE_REPO_BASE="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main"
+declare -A ALPINE_ARCH_MAP=( ["arm64-v8a"]="aarch64" ["armeabi-v7a"]="armhf" )
 
 fetch_busybox_alpine() {
     local abi="$1"
@@ -125,4 +125,4 @@ for f in "$JNI_DIR"/*/*.so; do
     echo "OK: $f ($(du -h "$f" | cut -f1))"
 done
 
-echo "=== Hoàn tất tải và chuẩn bị native binaries ==="
+echo "=== Hoàn tất tải và chuẩn bị native binaries ==="l
