@@ -39,7 +39,7 @@ cd proot-builder
 # Chỉ update 2 submodule cần thiết (proot và samba cho talloc)
 git submodule update --init vendor/proot vendor/samba
 
-# 🔥 Build cả arm64 và arm bằng script có sẵn của oonid/pr
+# 🔥 Build cả arm64 và arm bằng script có sẵn
 # KHÔNG patch, KHÔNG sed, KHÔNG thêm bất cứ thứ gì
 echo "[build] Build cho arm64 và arm..."
 ./scripts/build.sh --arch=all
