@@ -36,8 +36,12 @@ fi
 git clone --depth 1 https://github.com/oonid/pr.git proot-builder
 cd proot-builder
 
-# Chỉ update 2 submodule cần thiết (proot và samba cho talloc)
+# Chỉ update 2 submodule cần thiết
 git submodule update --init vendor/proot vendor/samba
+
+# 🔥 Patch build.sh để build loader trước proot
+# Tìm dòng "make -C \"\${SRC_DIR}/src\" \" và chèn dòng build loader lên trên
+sed -i '/^    make -C "\${SRC_DIR}\/src" \\/i\    make -C "${SRC_DIR}/src" loader' scripts/build.sh
 
 # Build cho arm64 và arm
 for arch in arm64 arm; do
