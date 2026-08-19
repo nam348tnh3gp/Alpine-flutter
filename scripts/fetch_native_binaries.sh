@@ -33,14 +33,14 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
     git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf git@github.com:
 fi
 
-# Clone repo
 git clone --depth 1 https://github.com/oonid/pr.git proot-builder
 cd proot-builder
 
-# Update submodule cần thiết (proot + samba cho talloc)
+# Chỉ update 2 submodule cần thiết (proot và samba cho talloc)
 git submodule update --init vendor/proot vendor/samba
 
-# 🔥 Build cả arm64 và arm một lần - KHÔNG patch gì hết
+# 🔥 Build cả arm64 và arm bằng script có sẵn của oonid/pr
+# KHÔNG patch, KHÔNG sed, KHÔNG thêm bất cứ thứ gì
 echo "[build] Build cho arm64 và arm..."
 ./scripts/build.sh --arch=all
 
