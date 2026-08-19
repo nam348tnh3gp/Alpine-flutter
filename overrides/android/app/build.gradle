@@ -21,9 +21,15 @@ android {
     defaultConfig {
         applicationId = "com.example.alpinerunner"
         minSdk = 26
-        targetSdk = 28   // 🔥 bypass W^X
+        targetSdk = 28   // 🔥 bypass W^X (vẫn giữ vì còn SELinux nhưng JNI giúp bypass)
         versionCode = 1
         versionName = "1.0.0"
+
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++17"
+            }
+        }
     }
 
     // 🔥 Tắt lint ExpiredTargetSdkVersion vì app không publish lên Play Store
@@ -48,6 +54,12 @@ android {
 
     sourceSets {
         main.jniLibs.srcDirs += ["src/main/jniLibs"]
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+        }
     }
 }
 
