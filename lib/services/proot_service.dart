@@ -36,7 +36,7 @@ class PRootService {
     final releaseOk = File('$rootfs/etc/alpine-release').existsSync();
     final busyboxOk = File('$rootfs/bin/busybox').existsSync();
     if (releaseOk && !busyboxOk) {
-      _log('⚠️ Phát hiện rootfs cài dở từ lần trước (thiếu /bin/busybox) - sẽ cài lại.');
+      _log('⚠️ Phát hiện rootfs cài dở (thiếu /bin/busybox) - sẽ cài lại.');
     }
     return releaseOk && busyboxOk;
   }
@@ -52,7 +52,8 @@ class PRootService {
     }
     Directory(rootfs).createSync(recursive: true);
 
-    final url = 'https://dl-cdn.alpinelinux.org/alpine/v${_alpineVersion.substring(0, 4)}/'
+    final url =
+        'https://dl-cdn.alpinelinux.org/alpine/v${_alpineVersion.substring(0, 4)}/'
         'releases/$alpineArch/alpine-minirootfs-$_alpineVersion-$alpineArch.tar.gz';
 
     _log('📥 Đang tải Alpine minirootfs ($alpineArch)...\n$url');
@@ -111,9 +112,32 @@ class PRootService {
       }
     }
     _log('   -> $fileCount file, $dirCount thư mục, $linkCount symlink');
-    onProgress(0.92);
+    onProgress(0.88);
 
     await File(tarGzPath).delete().catchError((_) => File(tarGzPath));
+
+    // package:tar KHÔNG giữ execute bit — tất cả file được tạo với 0644.
+    // Kernel vẫn kiểm tra permission bit (độc lập với SELinux), nên dù
+    // targetSdk=28 mở W^X thì busybox/apk/... vẫn bị "Permission denied"
+    // nếu thiếu bước này.
+    _log('🔧 Cấp quyền execute cho binary trong rootfs...');
+    for (final binDir in ['bin', 'sbin', 'usr/bin', 'usr/sbin', 'usr/lib/apk']) {
+      final dir = Directory('$rootfs/$binDir');
+      if (!dir.existsSync()) continue;
+      await Process.run('chmod', ['-R', 'a+x', dir.path]);
+    }
+
+    // Đảm bảo /bin/sh symlink tồn tại
+    final shLink = Link('$rootfs/bin/sh');
+    if (!shLink.existsSync()) {
+      try {
+        if (File('$rootfs/bin/sh').existsSync()) File('$rootfs/bin/sh').deleteSync();
+        shLink.createSync('busybox');
+        _log('✅ Đã tạo /bin/sh -> busybox.');
+      } catch (e) {
+        _log('ℹ️ /bin/sh đã tồn tại từ tarball (bình thường).');
+      }
+    }
 
     for (final d in ['proc', 'sys', 'dev', 'tmp', 'root']) {
       Directory('$rootfs/$d').createSync(recursive: true);
@@ -121,28 +145,10 @@ class PRootService {
     File('$rootfs/etc/resolv.conf')
         .writeAsStringSync('nameserver 8.8.8.8\nnameserver 1.1.1.1\n');
 
-    final busyboxReal = '$rootfs/bin/busybox';
-    if (File(busyboxReal).existsSync()) {
-      await Process.run('chmod', ['755', busyboxReal]);
-    } else {
-      throw Exception('/bin/busybox không tồn tại sau khi giải nén.');
-    }
-
-    try {
-      final shLink = Link('$rootfs/bin/sh');
-      if (shLink.existsSync()) await shLink.delete();
-      if (File('$rootfs/bin/sh').existsSync()) File('$rootfs/bin/sh').deleteSync();
-      shLink.createSync('busybox');
-      _log('✅ Đã tạo /bin/sh -> busybox.');
-    } catch (e) {
-      _log('ℹ️ Không tạo được symlink /bin/sh ($e) - không sao.');
-    }
-
     onProgress(1.0);
     _log('✅ Hoàn tất cài đặt Alpine rootfs tại: $rootfs');
   }
 
-  // ===== START – phiên bản tối giản, chỉ dùng loader copy =====
   Future<Process> start({
     required List<String> command,
     void Function(String)? onStdout,
@@ -157,46 +163,31 @@ class PRootService {
       throw Exception('Không tìm thấy libproot.so tại: $prootBin');
     }
 
-    // ---- Copy loader vào filesDir (để đường dẫn sạch và chủ động quyền) ----
-    final loaderSource = '$libDir/libproot-loader.so';
-    final loaderCopy = '$filesDir/loader';
-    if (!File(loaderSource).existsSync()) {
-      throw Exception('Không tìm thấy loader tại $loaderSource.');
-    }
-    if (await File(loaderCopy).exists()) await File(loaderCopy).delete();
-    await File(loaderSource).copy(loaderCopy);
-    await Process.run('chmod', ['755', loaderCopy]);
-    _log('✅ Loader ready: $loaderCopy');
-
-    // loader32 (optional)
-    final loader32Source = '$libDir/libproot-loader32.so';
-    String? loader32Copy;
-    if (File(loader32Source).existsSync()) {
-      loader32Copy = '$filesDir/loader32';
-      if (await File(loader32Copy).exists()) await File(loader32Copy).delete();
-      await File(loader32Source).copy(loader32Copy);
-      await Process.run('chmod', ['755', loader32Copy]);
-      _log('✅ Loader32 ready: $loader32Copy');
+    // Loader nằm trong nativeLibraryDir — luôn exec-able trên mọi Android/API.
+    // Cần cho 2 lý do độc lập:
+    //   1) SELinux W^X (targetSdk>=29 chặn execve từ /data/...)
+    //      → targetSdk=28 giải quyết lý do này, nhưng loader vẫn cần cho #2.
+    //   2) ELF interpreter: Alpine dùng musl, binary của nó khai ELF interpreter
+    //      là /lib/ld-musl-aarch64.so.1. File này không tồn tại trên Android.
+    //      Kernel không thể exec binary musl dù SELinux cho phép — nó tìm
+    //      interpreter theo đường dẫn thật, không qua proot remapping.
+    //      Loader giải quyết bằng cách tự đọc/map ELF vào memory, không nhờ
+    //      kernel exec interpreter → cần loader trên MỌI targetSdk.
+    // Không cần copy loader ra filesDir: nativeLibraryDir luôn exec-able.
+    final loaderPath = '$libDir/libproot-loader.so';
+    if (!File(loaderPath).existsSync()) {
+      throw Exception(
+        'Không tìm thấy $loaderPath.\n'
+        'Build lại APK — fetch_native_binaries.sh cần tải loader từ gói '
+        'proot của Termux (libexec/proot/loader).',
+      );
     }
 
-    // ---- tmpDir ----
     final tmpDir = '$filesDir/proot-tmp';
-    if (await Directory(tmpDir).exists()) {
-      await Directory(tmpDir).delete(recursive: true);
-    }
     Directory(tmpDir).createSync(recursive: true);
 
-    // ---- Xử lý command: dùng /bin/busybox trong rootfs ----
     if (command.isEmpty) command = ['/bin/sh', '-l'];
-    final effectiveCommand = List<String>.from(command);
-    if (effectiveCommand.isNotEmpty && effectiveCommand.first == '/bin/sh') {
-      effectiveCommand
-        ..removeAt(0)
-        ..insertAll(0, ['/bin/busybox', 'sh']);
-      _log('ℹ️ Dùng busybox trong rootfs: /bin/busybox sh');
-    }
 
-    // ---- Args (không verbose, không bind thêm) ----
     final args = <String>[
       '-0',
       '--link2symlink',
@@ -207,15 +198,13 @@ class PRootService {
       '-b', '/sys',
       '-b', '$tmpDir:/tmp',
       '-w', '/root',
-      ...effectiveCommand,
+      ...command,
     ];
 
-    // ---- Môi trường ----
     final env = <String, String>{
       'PROOT_TMP_DIR': tmpDir,
-      'PROOT_LOADER': loaderCopy,
-      if (loader32Copy != null) 'PROOT_LOADER_32': loader32Copy,
-      // Không cần LD_LIBRARY_PATH vì proot static
+      'PROOT_LOADER': loaderPath,
+      'LD_LIBRARY_PATH': libDir,
       'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
       'HOME': '/root',
       'TERM': 'xterm-256color',
@@ -223,8 +212,13 @@ class PRootService {
       'LINES': '24',
     };
 
+    final loader32 = '$libDir/libproot-loader32.so';
+    if (File(loader32).existsSync()) {
+      env['PROOT_LOADER_32'] = loader32;
+    }
+
     _log('🚀 Khởi chạy: $prootBin ${args.join(' ')}');
-    _log('   PROOT_LOADER=$loaderCopy');
+    _log('   PROOT_LOADER=$loaderPath');
 
     final process = await Process.start(
       prootBin,
@@ -233,8 +227,11 @@ class PRootService {
       runInShell: false,
     );
 
+    process.stderr.transform(utf8.decoder).listen((s) {
+      _log('[proot] $s');
+      onStderr?.call(s);
+    });
     process.stdout.transform(utf8.decoder).listen((s) => onStdout?.call(s));
-    process.stderr.transform(utf8.decoder).listen((s) => onStderr?.call(s));
     process.exitCode.then((code) => _log('Process exited with code $code'));
 
     _currentProcess = process;
