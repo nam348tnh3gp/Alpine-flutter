@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:tar/tar.dart';
 import 'package:http/http.dart' as http;
 import 'native_bridge.dart';
+import '../proot_jni.dart';
 
 class PRootService {
   static const _alpineVersion = '3.19.9';
@@ -116,10 +117,6 @@ class PRootService {
 
     await File(tarGzPath).delete().catchError((_) => File(tarGzPath));
 
-    // package:tar KHÔNG giữ execute bit — tất cả file được tạo với 0644.
-    // Kernel vẫn kiểm tra permission bit (độc lập với SELinux), nên dù
-    // targetSdk=28 mở W^X thì busybox/apk/... vẫn bị "Permission denied"
-    // nếu thiếu bước này.
     _log('🔧 Cấp quyền execute cho binary trong rootfs...');
     for (final binDir in ['bin', 'sbin', 'usr/bin', 'usr/sbin', 'usr/lib/apk']) {
       final dir = Directory('$rootfs/$binDir');
@@ -127,7 +124,6 @@ class PRootService {
       await Process.run('chmod', ['-R', 'a+x', dir.path]);
     }
 
-    // Đảm bảo /bin/sh symlink tồn tại
     final shLink = Link('$rootfs/bin/sh');
     if (!shLink.existsSync()) {
       try {
@@ -149,6 +145,7 @@ class PRootService {
     _log('✅ Hoàn tất cài đặt Alpine rootfs tại: $rootfs');
   }
 
+  // ---- START: Gọi JNI thay vì Process.start ----
   Future<Process> start({
     required List<String> command,
     void Function(String)? onStdout,
@@ -163,17 +160,6 @@ class PRootService {
       throw Exception('Không tìm thấy libproot.so tại: $prootBin');
     }
 
-    // Loader nằm trong nativeLibraryDir — luôn exec-able trên mọi Android/API.
-    // Cần cho 2 lý do độc lập:
-    //   1) SELinux W^X (targetSdk>=29 chặn execve từ /data/...)
-    //      → targetSdk=28 giải quyết lý do này, nhưng loader vẫn cần cho #2.
-    //   2) ELF interpreter: Alpine dùng musl, binary của nó khai ELF interpreter
-    //      là /lib/ld-musl-aarch64.so.1. File này không tồn tại trên Android.
-    //      Kernel không thể exec binary musl dù SELinux cho phép — nó tìm
-    //      interpreter theo đường dẫn thật, không qua proot remapping.
-    //      Loader giải quyết bằng cách tự đọc/map ELF vào memory, không nhờ
-    //      kernel exec interpreter → cần loader trên MỌI targetSdk.
-    // Không cần copy loader ra filesDir: nativeLibraryDir luôn exec-able.
     final loaderPath = '$libDir/libproot-loader.so';
     if (!File(loaderPath).existsSync()) {
       throw Exception(
@@ -210,6 +196,7 @@ class PRootService {
       'TERM': 'xterm-256color',
       'COLUMNS': '80',
       'LINES': '24',
+      'PROOT_NO_SECCOMP': '1',
     };
 
     final loader32 = '$libDir/libproot-loader32.so';
@@ -217,25 +204,20 @@ class PRootService {
       env['PROOT_LOADER_32'] = loader32;
     }
 
-    _log('🚀 Khởi chạy: $prootBin ${args.join(' ')}');
+    _log('🚀 Khởi chạy JNI: $prootBin ${args.join(' ')}');
     _log('   PROOT_LOADER=$loaderPath');
 
-    final process = await Process.start(
+    // Gọi JNI thay vì Process.start
+    final exitCode = await ProotJNI.runProot(
       prootBin,
       args,
-      environment: env,
-      runInShell: false,
+      env,
     );
 
-    process.stderr.transform(utf8.decoder).listen((s) {
-      _log('[proot] $s');
-      onStderr?.call(s);
-    });
-    process.stdout.transform(utf8.decoder).listen((s) => onStdout?.call(s));
-    process.exitCode.then((code) => _log('Process exited with code $code'));
-
-    _currentProcess = process;
-    return process;
+    _log('Process exited with code $exitCode');
+    // Trả về Process giả để tương thích với code cũ
+    // Bạn có thể thay đổi kiến trúc để không cần Process object
+    return Future.value(Process(...));
   }
 
   void stop() {
