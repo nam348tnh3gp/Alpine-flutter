@@ -33,24 +33,16 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
     git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf git@github.com:
 fi
 
+# Clone repo
 git clone --depth 1 https://github.com/oonid/pr.git proot-builder
 cd proot-builder
 
-# Chỉ update 2 submodule cần thiết
+# Update submodule cần thiết (proot + samba cho talloc)
 git submodule update --init vendor/proot vendor/samba
 
-# 🔥 Sửa build.sh: build loader.elf trước proot
-# Tìm dòng "make -C \"\${SRC_DIR}/src\" \" (có dấu \ ở cuối) và chèn dòng build loader.elf lên trên
-sed -i '/^    make -C "\${SRC_DIR}\/src" \\/i\    make -C "${SRC_DIR}/src" loader.elf' scripts/build.sh
-
-# Build cho arm64 và arm
-for arch in arm64 arm; do
-    echo "[build] Đang build cho $arch ..."
-    # Thử build với --skip-ndk (nếu NDK đã có), nếu fail thì build bình thường
-    ./scripts/build.sh --arch="$arch" --skip-ndk 2>/dev/null || {
-        ./scripts/build.sh --arch="$arch"
-    }
-done
+# 🔥 Build cả arm64 và arm một lần - KHÔNG patch gì hết
+echo "[build] Build cho arm64 và arm..."
+./scripts/build.sh --arch=all
 
 # Copy vào jniLibs
 cp build/out/arm64/proot "$OLDPWD/$JNI_DIR/arm64-v8a/libproot.so"
