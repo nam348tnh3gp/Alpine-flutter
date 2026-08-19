@@ -39,9 +39,9 @@ cd proot-builder
 # Chỉ update 2 submodule cần thiết
 git submodule update --init vendor/proot vendor/samba
 
-# 🔥 Patch build.sh để build loader trước proot
-# Tìm dòng "make -C \"\${SRC_DIR}/src\" \" và chèn dòng build loader lên trên
-sed -i '/^    make -C "\${SRC_DIR}\/src" \\/i\    make -C "${SRC_DIR}/src" loader' scripts/build.sh
+# 🔥 Sửa build.sh: build loader.elf trước proot
+# Tìm dòng "make -C \"\${SRC_DIR}/src\" \" (có dấu \ ở cuối) và chèn dòng build loader.elf lên trên
+sed -i '/^    make -C "\${SRC_DIR}\/src" \\/i\    make -C "${SRC_DIR}/src" loader.elf' scripts/build.sh
 
 # Build cho arm64 và arm
 for arch in arm64 arm; do
@@ -65,7 +65,7 @@ chmod 755 "$OLDPWD/$JNI_DIR/arm64-v8a/libproot.so" \
 
 echo "✅ Build proot + loader hoàn tất"
 
-# ---- Tải busybox-static từ Alpine (chỉ để trong jniLibs, không dùng trong runtime) ----
+# ---- Tải busybox-static từ Alpine ----
 echo "=== Tải busybox-static từ Alpine ==="
 
 fetch_busybox_alpine() {
