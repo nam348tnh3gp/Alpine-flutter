@@ -24,6 +24,7 @@ typedef struct {
 } LogCtx;
 
 static int g_master_fd = -1;
+static pid_t g_child_pid = -1;
 
 static void emit_log(LogCtx *ctx, const char *prefix, const char *line, size_t len) {
     if (ctx->callback == NULL || ctx->onLogMid == NULL) {
@@ -137,13 +138,20 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         }
     }
 
-    // ---- Tạo PTY dùng posix_openpt (không cần -lutil) ----
+    // Tạo PTY dùng posix_openpt
     int master_fd, slave_fd;
     struct termios term;
     struct winsize win;
-    tcgetattr(STDIN_FILENO, &term);
-    win.ws_row = 30;
-    win.ws_col = 120;
+
+    // Lấy termios từ stdin (nếu fail, dùng default)
+    if (tcgetattr(STDIN_FILENO, &term) != 0) {
+        cfmakeraw(&term);
+        term.c_lflag |= (ECHO | ICANON | ISIG);
+        term.c_oflag |= OPOST | ONLCR;
+    }
+    // Kích thước mặc định
+    win.ws_row = 24;
+    win.ws_col = 80;
     win.ws_xpixel = 0;
     win.ws_ypixel = 0;
 
@@ -179,6 +187,7 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
     }
     tcsetattr(slave_fd, TCSANOW, &term);
     ioctl(slave_fd, TIOCSWINSZ, &win);
+
     g_master_fd = master_fd;
 
     pid_t pid = fork();
@@ -204,6 +213,7 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         return -1;
     }
 
+    g_child_pid = pid;
     close(slave_fd);
     fcntl(master_fd, F_SETFL, O_NONBLOCK);
 
@@ -230,6 +240,8 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
     drain_fd(master_fd, &ctx, "[pty]", linebuf, &linelen, sizeof(linebuf));
     if (linelen > 0) emit_log(&ctx, "[pty]", linebuf, linelen);
     close(master_fd);
+    g_master_fd = -1;
+    g_child_pid = -1;
 
     if (WIFEXITED(status)) {
         exitCode = WEXITSTATUS(status);
@@ -259,11 +271,57 @@ Java_com_example_alpinerunner_ProotLauncher_writeToPty(
     JNIEnv *env,
     jobject thiz,
     jbyteArray data) {
-    if (g_master_fd == -1) return -1;
+    if (g_master_fd == -1) {
+        LOGE("writeToPty: g_master_fd is -1");
+        return -1;
+    }
     jsize len = (*env)->GetArrayLength(env, data);
     jbyte *bytes = (*env)->GetByteArrayElements(env, data, NULL);
-    if (bytes == NULL) return -1;
+    if (bytes == NULL) {
+        LOGE("writeToPty: bytes == NULL");
+        return -1;
+    }
     ssize_t written = write(g_master_fd, bytes, len);
+    if (written < 0) {
+        LOGE("writeToPty: write failed: %s (errno=%d)", strerror(errno), errno);
+    }
     (*env)->ReleaseByteArrayElements(env, data, bytes, JNI_ABORT);
     return (jint)written;
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_alpinerunner_ProotLauncher_killProot(JNIEnv *env, jobject thiz) {
+    if (g_child_pid > 0) {
+        kill(g_child_pid, SIGTERM);
+        // Chờ một chút để child kịp exit (không block lâu)
+        usleep(100000);
+        // Nếu vẫn còn, kill mạnh
+        if (kill(g_child_pid, 0) == 0) {
+            kill(g_child_pid, SIGKILL);
+        }
+        g_child_pid = -1;
+    }
+    if (g_master_fd != -1) {
+        close(g_master_fd);
+        g_master_fd = -1;
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_alpinerunner_ProotLauncher_resizePty(
+    JNIEnv *env,
+    jobject thiz,
+    jint width,
+    jint height) {
+    if (g_master_fd == -1) return;
+    struct winsize win;
+    win.ws_row = (unsigned short)height;
+    win.ws_col = (unsigned short)width;
+    win.ws_xpixel = 0;
+    win.ws_ypixel = 0;
+    ioctl(g_master_fd, TIOCSWINSZ, &win);
+    // Có thể gửi SIGWINCH tới child nếu cần
+    if (g_child_pid > 0) {
+        kill(g_child_pid, SIGWINCH);
+    }
 }
