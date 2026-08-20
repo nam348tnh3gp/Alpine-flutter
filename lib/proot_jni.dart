@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 class ProotJNI {
   static const MethodChannel _channel = MethodChannel('alpine_runner/proot');
 
+  /// Gọi native fork+exec qua JNI, trả về exit code
   static Future<int> runProot(
     String prootPath,
     List<String> args,
