@@ -6,4 +6,4 @@ add_library(proot_launcher SHARED proot_launcher.c)
 find_library(log-lib log)
 
 target_include_directories(proot_launcher PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(proot_launcher ${log-lib} util)
+target_link_libraries(proot_launcher ${log-lib})
