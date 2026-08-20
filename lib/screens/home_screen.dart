@@ -1,34 +1,11 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:xterm/xterm.dart';
-import 'package:xterm/input.dart'; // Import InputSink
 import '../services/proot_service.dart';
 
 enum RunMode { cli, gui }
-
-// Custom InputSink chuyển tiếp dữ liệu từ bàn phím tới PRootService
-class _ProotInputSink implements InputSink {
-  final void Function(String data) onInput;
-
-  _ProotInputSink(this.onInput);
-
-  @override
-  void add(List<int> data) {
-    if (data.isNotEmpty) {
-      onInput(String.fromCharCodes(data));
-    }
-  }
-
-  @override
-  void addError(Object error, [StackTrace? stackTrace]) {}
-
-  @override
-  Future<void> close() async {}
-
-  @override
-  Future<void> get done => Future.value();
-}
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -51,13 +28,6 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
     _proot = PRootService(onLog: (l) => _terminal.write('$l\r\n'));
-
-    // Gán custom InputSink để nhận dữ liệu bàn phím từ TerminalView
-    _terminal.input = _ProotInputSink((data) {
-      // Gửi dữ liệu tới PTY thông qua PRootService
-      _proot.sendInput(data);
-    });
-
     _checkInstalled();
   }
 
@@ -65,6 +35,12 @@ class _HomeScreenState extends State<HomeScreen> {
   void dispose() {
     _terminalFocusNode.dispose();
     super.dispose();
+  }
+
+  // Callback khi người dùng gõ trên terminal → gửi sang PTY
+  void _onInput(String data) {
+    // Gửi bất đồng bộ, không chặn UI
+    unawaited(_proot.sendInput(data));
   }
 
   Future<void> _checkInstalled() async {
@@ -180,6 +156,7 @@ class _HomeScreenState extends State<HomeScreen> {
               child: TerminalView(
                 _terminal,
                 focusNode: _terminalFocusNode,
+                onInput: _onInput, // 🔥 Truyền callback input tại đây
               ),
             ),
         ],
