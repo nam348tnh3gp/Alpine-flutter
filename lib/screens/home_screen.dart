@@ -2,9 +2,33 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:xterm/xterm.dart';
+import 'package:xterm/input.dart'; // Import InputSink
 import '../services/proot_service.dart';
 
 enum RunMode { cli, gui }
+
+// Custom InputSink chuyển tiếp dữ liệu từ bàn phím tới PRootService
+class _ProotInputSink implements InputSink {
+  final void Function(String data) onInput;
+
+  _ProotInputSink(this.onInput);
+
+  @override
+  void add(List<int> data) {
+    if (data.isNotEmpty) {
+      onInput(String.fromCharCodes(data));
+    }
+  }
+
+  @override
+  void addError(Object error, [StackTrace? stackTrace]) {}
+
+  @override
+  Future<void> close() async {}
+
+  @override
+  Future<void> get done => Future.value();
+}
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -22,56 +46,23 @@ class _HomeScreenState extends State<HomeScreen> {
   double _progress = 0;
   RunMode? _mode;
   bool _running = false;
-  StreamSubscription<KeyEvent>? _keySubscription;
 
   @override
   void initState() {
     super.initState();
     _proot = PRootService(onLog: (l) => _terminal.write('$l\r\n'));
-    _checkInstalled();
 
-    // Lắng nghe bàn phím từ terminal và gửi sang PTY
-    _keySubscription = _terminal.onKey.listen((event) {
-      if (event.char != null) {
-        _proot.sendInput(event.char!);
-      } else {
-        // Xử lý các phím đặc biệt (không có ký tự)
-        switch (event.key) {
-          case 'Enter':
-            _proot.sendInput('\r');
-            break;
-          case 'Backspace':
-            _proot.sendInput('\x7f');
-            break;
-          case 'Tab':
-            _proot.sendInput('\t');
-            break;
-          case 'Escape':
-            _proot.sendInput('\x1b');
-            break;
-          case 'ArrowUp':
-            _proot.sendInput('\x1b[A');
-            break;
-          case 'ArrowDown':
-            _proot.sendInput('\x1b[B');
-            break;
-          case 'ArrowRight':
-            _proot.sendInput('\x1b[C');
-            break;
-          case 'ArrowLeft':
-            _proot.sendInput('\x1b[D');
-            break;
-          default:
-            // Bỏ qua các phím khác
-            break;
-        }
-      }
+    // Gán custom InputSink để nhận dữ liệu bàn phím từ TerminalView
+    _terminal.input = _ProotInputSink((data) {
+      // Gửi dữ liệu tới PTY thông qua PRootService
+      _proot.sendInput(data);
     });
+
+    _checkInstalled();
   }
 
   @override
   void dispose() {
-    _keySubscription?.cancel();
     _terminalFocusNode.dispose();
     super.dispose();
   }
