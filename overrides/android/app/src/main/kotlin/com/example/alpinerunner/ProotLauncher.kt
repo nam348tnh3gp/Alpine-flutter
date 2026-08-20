@@ -2,13 +2,6 @@ package com.example.alpinerunner
 
 import android.content.Context
 
-/**
- * Callback được gọi từ native (JNI) mỗi khi có một dòng log mới từ
- * proot (stdout/stderr) hoặc từ launcher (chẩn đoán execve/fork/pipe).
- * Được gọi TRÊN THREAD ĐANG CHẠY runProot() (không phải main thread),
- * nên phía Kotlin nhận callback này phải tự post về main thread nếu
- * cần cập nhật UI hoặc gọi MethodChannel/EventChannel.
- */
 fun interface ProotLogCallback {
     fun onLog(line: String)
 }
@@ -26,6 +19,9 @@ class ProotLauncher {
             env: Array<String>,
             logCallback: ProotLogCallback?
         ): Int
+
+        @JvmStatic
+        external fun writeToPty(data: ByteArray): Int
 
         fun launch(
             context: Context,
