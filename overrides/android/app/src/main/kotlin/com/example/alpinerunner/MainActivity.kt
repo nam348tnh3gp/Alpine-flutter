@@ -15,7 +15,9 @@ class MainActivity : FlutterActivity() {
     private val PROOT_LOG_CHANNEL = "alpine_runner/proot_logs"
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    // Dùng 2 executor riêng để writeToPty không bị block bởi runProot
     private val prootExecutor = Executors.newSingleThreadExecutor()
+    private val ptyExecutor = Executors.newSingleThreadExecutor()
 
     private var logSink: EventChannel.EventSink? = null
 
@@ -77,9 +79,23 @@ class MainActivity : FlutterActivity() {
                             result.error("BAD_ARGS", "Missing data", null)
                             return@setMethodCallHandler
                         }
-                        prootExecutor.execute {
+                        ptyExecutor.execute {
                             val written = ProotLauncher.writeToPty(data)
                             mainHandler.post { result.success(written) }
+                        }
+                    }
+                    "killProot" -> {
+                        ptyExecutor.execute {
+                            ProotLauncher.killProot()
+                            mainHandler.post { result.success(null) }
+                        }
+                    }
+                    "resizePty" -> {
+                        val width = call.argument<Int>("width") ?: 80
+                        val height = call.argument<Int>("height") ?: 24
+                        ptyExecutor.execute {
+                            ProotLauncher.resizePty(width, height)
+                            mainHandler.post { result.success(null) }
                         }
                     }
                     else -> result.notImplemented()
