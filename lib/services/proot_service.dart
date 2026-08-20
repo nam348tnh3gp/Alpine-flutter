@@ -34,13 +34,14 @@ class FakeProcess implements Process {
   @override
   bool kill([ProcessSignal signal = ProcessSignal.sigterm]) => false;
 
-  // Hỗ trợ ghi output từ JNI nếu có (sẽ được gọi từ một callback riêng)
+  // Hỗ trợ ghi output từ JNI nếu có callback
   void addStdout(List<int> data) => _stdoutController.add(data);
   void addStderr(List<int> data) => _stderrController.add(data);
   void closeStdout() => _stdoutController.close();
   void closeStderr() => _stderrController.close();
 }
 
+// ===== PRootService =====
 class PRootService {
   static const _alpineVersion = '3.19.9';
   static const _alpineArchMap = {
@@ -209,7 +210,9 @@ class PRootService {
 
     if (command.isEmpty) command = ['/bin/sh', '-l'];
 
+    // 🔥 Thêm -v 5 để debug
     final args = <String>[
+      '-v', '5',
       '-0',
       '--link2symlink',
       '--kill-on-exit',
