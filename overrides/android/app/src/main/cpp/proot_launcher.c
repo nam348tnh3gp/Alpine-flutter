@@ -12,6 +12,7 @@
 #include <android/log.h>
 #include <termios.h>
 #include <sys/ioctl.h>
+#include <dirent.h>
 
 #define LOG_TAG "ProotLauncher"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -67,7 +68,9 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
     jstring prootPath,
     jobjectArray argsArray,
     jobjectArray envArray,
-    jobject logCallback) {
+    jobject logCallback,
+    jint rows,
+    jint cols) {
 
     LogCtx ctx = {0};
     ctx.env = env;
@@ -77,7 +80,7 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         ctx.onLogMid = (*env)->GetMethodID(env, cbClass, "onLog", "(Ljava/lang/String;)V");
         if (ctx.onLogMid == NULL) {
             (*env)->ExceptionClear(env);
-            LOGE("logCallback không có method onLog(String) - log sẽ chỉ vào logcat");
+            LOGE("logCallback không có method onLog(String)");
         }
     }
 
@@ -91,15 +94,15 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
     struct stat st;
     if (stat(proot, &st) != 0) {
         char msg[512];
-        int n = snprintf(msg, sizeof(msg), "[launcher] Không tìm thấy proot binary tại '%s': %s (errno=%d)",
-                          proot, strerror(errno), errno);
+        int n = snprintf(msg, sizeof(msg), "[launcher] Không tìm thấy proot binary tại '%s': %s", proot, strerror(errno));
         emit_log(&ctx, "[launcher]", msg, (size_t)n);
+        (*env)->ReleaseStringUTFChars(env, prootPath, proot);
         return -1;
     } else if (!(st.st_mode & S_IXUSR)) {
         char msg[512];
-        int n = snprintf(msg, sizeof(msg), "[launcher] '%s' tồn tại nhưng thiếu quyền execute (mode=%o)",
-                          proot, st.st_mode & 0777);
+        int n = snprintf(msg, sizeof(msg), "[launcher] '%s' thiếu quyền execute", proot);
         emit_log(&ctx, "[launcher]", msg, (size_t)n);
+        (*env)->ReleaseStringUTFChars(env, prootPath, proot);
         return -1;
     }
 
@@ -138,85 +141,103 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         }
     }
 
-    // Tạo PTY dùng posix_openpt
-    int master_fd, slave_fd;
-    struct termios term;
-    struct winsize win;
-
-    // Lấy termios từ stdin (nếu fail, dùng default)
-    if (tcgetattr(STDIN_FILENO, &term) != 0) {
-        cfmakeraw(&term);
-        term.c_lflag |= (ECHO | ICANON | ISIG);
-        term.c_oflag |= OPOST | ONLCR;
-    }
-    // Kích thước mặc định
-    win.ws_row = 24;
-    win.ws_col = 80;
-    win.ws_xpixel = 0;
-    win.ws_ypixel = 0;
-
-    master_fd = posix_openpt(O_RDWR | O_NOCTTY);
-    if (master_fd == -1) {
+    // --- Tạo PTY giống Termux ---
+    int master_fd = open("/dev/ptmx", O_RDWR | O_CLOEXEC);
+    if (master_fd < 0) {
         char msg[256];
-        int n = snprintf(msg, sizeof(msg), "[launcher] posix_openpt thất bại: %s", strerror(errno));
+        int n = snprintf(msg, sizeof(msg), "[launcher] open(/dev/ptmx) thất bại: %s", strerror(errno));
         emit_log(&ctx, "[launcher]", msg, (size_t)n);
         return -1;
     }
-    if (grantpt(master_fd) == -1 || unlockpt(master_fd) == -1) {
+
+    char devname[64];
+    if (grantpt(master_fd) || unlockpt(master_fd) ||
+        ptsname_r(master_fd, devname, sizeof(devname)) != 0) {
         char msg[256];
-        int n = snprintf(msg, sizeof(msg), "[launcher] grantpt/unlockpt thất bại: %s", strerror(errno));
+        int n = snprintf(msg, sizeof(msg), "[launcher] grantpt/unlockpt/ptsname_r thất bại");
         emit_log(&ctx, "[launcher]", msg, (size_t)n);
         close(master_fd);
         return -1;
     }
-    const char* slave_name = ptsname(master_fd);
-    if (slave_name == NULL) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "[launcher] ptsname thất bại: %s", strerror(errno));
-        emit_log(&ctx, "[launcher]", msg, strlen(msg));
-        close(master_fd);
-        return -1;
-    }
-    slave_fd = open(slave_name, O_RDWR | O_NOCTTY);
-    if (slave_fd == -1) {
-        char msg[256];
-        int n = snprintf(msg, sizeof(msg), "[launcher] mở slave '%s' thất bại: %s", slave_name, strerror(errno));
-        emit_log(&ctx, "[launcher]", msg, (size_t)n);
-        close(master_fd);
-        return -1;
-    }
-    tcsetattr(slave_fd, TCSANOW, &term);
-    ioctl(slave_fd, TIOCSWINSZ, &win);
 
-    g_master_fd = master_fd;
+    // Cấu hình termios theo Termux
+    struct termios tios;
+    tcgetattr(master_fd, &tios);
+    tios.c_iflag |= IUTF8;
+    tios.c_iflag &= ~(IXON | IXOFF);
+    tios.c_lflag |= (ECHO | ICANON | ISIG | IEXTEN);
+    tios.c_oflag |= (OPOST | ONLCR);
+    tios.c_iflag |= (ICRNL | IXON);
+    tios.c_cc[VERASE] = 127;
+    tios.c_cc[VINTR] = 3;
+    tios.c_cc[VQUIT] = 28;
+    tios.c_cc[VSUSP] = 26;
+    tcsetattr(master_fd, TCSANOW, &tios);
+
+    // Đặt kích thước
+    if (rows <= 0) rows = 24;
+    if (cols <= 0) cols = 80;
+    struct winsize sz = {
+        .ws_row = (unsigned short) rows,
+        .ws_col = (unsigned short) cols,
+        .ws_xpixel = (unsigned short) (cols * 8),
+        .ws_ypixel = (unsigned short) (rows * 16)
+    };
+    ioctl(master_fd, TIOCSWINSZ, &sz);
 
     pid_t pid = fork();
     if (pid == 0) {
+        // Tiến trình con
         close(master_fd);
         setsid();
-        ioctl(slave_fd, TIOCSCTTY, 0);
-        dup2(slave_fd, STDIN_FILENO);
-        dup2(slave_fd, STDOUT_FILENO);
-        dup2(slave_fd, STDERR_FILENO);
-        close(slave_fd);
-        execve(proot, argv, envp);
-        fprintf(stderr, "[launcher] execve('%s') thất bại: %s (errno=%d)\n",
-                proot, strerror(errno), errno);
-        fflush(stderr);
+
+        int slave_fd = open(devname, O_RDWR);
+        if (slave_fd < 0) _exit(127);
+
+        dup2(slave_fd, 0);
+        dup2(slave_fd, 1);
+        dup2(slave_fd, 2);
+
+        // Đóng tất cả file descriptor > 2
+        DIR *self_dir = opendir("/proc/self/fd");
+        if (self_dir != NULL) {
+            int self_dir_fd = dirfd(self_dir);
+            struct dirent *entry;
+            while ((entry = readdir(self_dir)) != NULL) {
+                int fd = atoi(entry->d_name);
+                if (fd > 2 && fd != self_dir_fd) close(fd);
+            }
+            closedir(self_dir);
+        }
+
+        // Xóa environment và set mới
+        clearenv();
+        if (envp) {
+            for (char **p = envp; *p; ++p) putenv(*p);
+        }
+
+        // Chuyển đến thư mục gốc (có thể thay đổi nếu muốn)
+        if (chdir("/") != 0) {
+            perror("chdir");
+        }
+
+        execvp(proot, argv);
+        // Nếu execvp thất bại
+        perror("execvp");
         _exit(127);
     } else if (pid < 0) {
-        char msg[256];
-        int n = snprintf(msg, sizeof(msg), "[launcher] fork() thất bại: %s (errno=%d)", strerror(errno), errno);
+        char msg[128];
+        int n = snprintf(msg, sizeof(msg), "[launcher] fork thất bại: %s", strerror(errno));
         emit_log(&ctx, "[launcher]", msg, (size_t)n);
         close(master_fd);
-        close(slave_fd);
         return -1;
     }
 
+    g_master_fd = master_fd;
     g_child_pid = pid;
-    close(slave_fd);
-    fcntl(master_fd, F_SETFL, O_NONBLOCK);
 
+    // Đọc output từ master và forward qua log callback
+    fcntl(master_fd, F_SETFL, O_NONBLOCK);
     char linebuf[4096]; size_t linelen = 0;
     int status = 0;
     int childExited = 0;
@@ -230,8 +251,8 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         if (r == pid) {
             childExited = 1;
         } else if (r < 0 && errno != EINTR) {
-            char msg[256];
-            int n = snprintf(msg, sizeof(msg), "[launcher] waitpid() lỗi: %s (errno=%d)", strerror(errno), errno);
+            char msg[128];
+            int n = snprintf(msg, sizeof(msg), "[launcher] waitpid lỗi: %s", strerror(errno));
             emit_log(&ctx, "[launcher]", msg, (size_t)n);
             break;
         }
@@ -246,13 +267,12 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
     if (WIFEXITED(status)) {
         exitCode = WEXITSTATUS(status);
         if (exitCode == 127) {
-            const char *m = "exit code 127 = execve() that bai (xem dong '[launcher] execve(...) that bai' phia tren de biet ly do chinh xac)";
+            const char *m = "execvp thất bại (127)";
             emit_log(&ctx, "[launcher]", m, strlen(m));
         }
     } else if (WIFSIGNALED(status)) {
         char msg[128];
-        int n = snprintf(msg, sizeof(msg), "[launcher] proot bị kill bởi signal %d (%s)",
-                          WTERMSIG(status), strsignal(WTERMSIG(status)));
+        int n = snprintf(msg, sizeof(msg), "[launcher] bị kill bởi signal %d", WTERMSIG(status));
         emit_log(&ctx, "[launcher]", msg, (size_t)n);
         exitCode = 128 + WTERMSIG(status);
     }
@@ -272,18 +292,18 @@ Java_com_example_alpinerunner_ProotLauncher_writeToPty(
     jobject thiz,
     jbyteArray data) {
     if (g_master_fd == -1) {
-        LOGE("writeToPty: g_master_fd is -1");
+        LOGE("writeToPty: master_fd không hợp lệ");
         return -1;
     }
     jsize len = (*env)->GetArrayLength(env, data);
     jbyte *bytes = (*env)->GetByteArrayElements(env, data, NULL);
     if (bytes == NULL) {
-        LOGE("writeToPty: bytes == NULL");
+        LOGE("writeToPty: không lấy được bytes");
         return -1;
     }
     ssize_t written = write(g_master_fd, bytes, len);
     if (written < 0) {
-        LOGE("writeToPty: write failed: %s (errno=%d)", strerror(errno), errno);
+        LOGE("writeToPty: write thất bại: %s", strerror(errno));
     }
     (*env)->ReleaseByteArrayElements(env, data, bytes, JNI_ABORT);
     return (jint)written;
@@ -293,9 +313,7 @@ JNIEXPORT void JNICALL
 Java_com_example_alpinerunner_ProotLauncher_killProot(JNIEnv *env, jobject thiz) {
     if (g_child_pid > 0) {
         kill(g_child_pid, SIGTERM);
-        // Chờ một chút để child kịp exit (không block lâu)
         usleep(100000);
-        // Nếu vẫn còn, kill mạnh
         if (kill(g_child_pid, 0) == 0) {
             kill(g_child_pid, SIGKILL);
         }
@@ -314,13 +332,15 @@ Java_com_example_alpinerunner_ProotLauncher_resizePty(
     jint width,
     jint height) {
     if (g_master_fd == -1) return;
-    struct winsize win;
-    win.ws_row = (unsigned short)height;
-    win.ws_col = (unsigned short)width;
-    win.ws_xpixel = 0;
-    win.ws_ypixel = 0;
-    ioctl(g_master_fd, TIOCSWINSZ, &win);
-    // Có thể gửi SIGWINCH tới child nếu cần
+    if (width <= 0) width = 80;
+    if (height <= 0) height = 24;
+    struct winsize sz = {
+        .ws_row = (unsigned short) height,
+        .ws_col = (unsigned short) width,
+        .ws_xpixel = (unsigned short) (width * 8),
+        .ws_ypixel = (unsigned short) (height * 16)
+    };
+    ioctl(g_master_fd, TIOCSWINSZ, &sz);
     if (g_child_pid > 0) {
         kill(g_child_pid, SIGWINCH);
     }
