@@ -32,9 +32,10 @@ class _HomeScreenState extends State<HomeScreen> {
     _proot = PRootService(onLog: (l) => _terminal.write('$l\r\n'));
     _checkInstalled();
 
-    // Lắng nghe dữ liệu nhập từ bàn phím trên terminal
+    // ✅ Lắng nghe sự kiện nhập từ bàn phím trên terminal
+    // KHÔNG truyền onInput vào TerminalView
     _inputSubscription = _terminal.onInput.listen((data) {
-      // Gửi sang PTY (bất đồng bộ)
+      // Gửi dữ liệu sang PTY (bất đồng bộ)
       _proot.sendInput(data);
     });
   }
@@ -159,7 +160,7 @@ class _HomeScreenState extends State<HomeScreen> {
               child: TerminalView(
                 _terminal,
                 focusNode: _terminalFocusNode,
-                // KHÔNG truyền onInput ở đây
+                // ✅ KHÔNG có tham số onInput
               ),
             ),
         ],
