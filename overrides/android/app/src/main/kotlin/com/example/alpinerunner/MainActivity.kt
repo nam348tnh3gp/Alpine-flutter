@@ -12,7 +12,7 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        // NativeBridge channel
+        // NativeBridge
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, NATIVE_CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
@@ -23,7 +23,7 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
-        // JNI proot launcher channel
+        // JNI proot
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, PROOT_CHANNEL)
             .setMethodCallHandler { call, result ->
                 if (call.method == "runProot") {
