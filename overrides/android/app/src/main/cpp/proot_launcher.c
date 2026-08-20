@@ -10,7 +10,6 @@
 #include <poll.h>
 #include <signal.h>
 #include <android/log.h>
-#include <pty.h>
 #include <termios.h>
 #include <sys/ioctl.h>
 
@@ -138,6 +137,7 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         }
     }
 
+    // ---- Tạo PTY dùng posix_openpt (không cần -lutil) ----
     int master_fd, slave_fd;
     struct termios term;
     struct winsize win;
@@ -147,31 +147,38 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
     win.ws_xpixel = 0;
     win.ws_ypixel = 0;
 
-    if (openpty(&master_fd, &slave_fd, NULL, &term, &win) == -1) {
-        master_fd = posix_openpt(O_RDWR | O_NOCTTY);
-        if (master_fd == -1) {
-            char msg[256];
-            int n = snprintf(msg, sizeof(msg), "[launcher] posix_openpt thất bại: %s", strerror(errno));
-            emit_log(&ctx, "[launcher]", msg, (size_t)n);
-            return -1;
-        }
-        if (grantpt(master_fd) == -1 || unlockpt(master_fd) == -1) {
-            char msg[256];
-            int n = snprintf(msg, sizeof(msg), "[launcher] grantpt/unlockpt thất bại: %s", strerror(errno));
-            emit_log(&ctx, "[launcher]", msg, (size_t)n);
-            close(master_fd);
-            return -1;
-        }
-        slave_fd = open(ptsname(master_fd), O_RDWR | O_NOCTTY);
-        if (slave_fd == -1) {
-            char msg[256];
-            int n = snprintf(msg, sizeof(msg), "[launcher] mở slave thất bại: %s", strerror(errno));
-            emit_log(&ctx, "[launcher]", msg, (size_t)n);
-            close(master_fd);
-            return -1;
-        }
+    master_fd = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master_fd == -1) {
+        char msg[256];
+        int n = snprintf(msg, sizeof(msg), "[launcher] posix_openpt thất bại: %s", strerror(errno));
+        emit_log(&ctx, "[launcher]", msg, (size_t)n);
+        return -1;
     }
-
+    if (grantpt(master_fd) == -1 || unlockpt(master_fd) == -1) {
+        char msg[256];
+        int n = snprintf(msg, sizeof(msg), "[launcher] grantpt/unlockpt thất bại: %s", strerror(errno));
+        emit_log(&ctx, "[launcher]", msg, (size_t)n);
+        close(master_fd);
+        return -1;
+    }
+    const char* slave_name = ptsname(master_fd);
+    if (slave_name == NULL) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "[launcher] ptsname thất bại: %s", strerror(errno));
+        emit_log(&ctx, "[launcher]", msg, strlen(msg));
+        close(master_fd);
+        return -1;
+    }
+    slave_fd = open(slave_name, O_RDWR | O_NOCTTY);
+    if (slave_fd == -1) {
+        char msg[256];
+        int n = snprintf(msg, sizeof(msg), "[launcher] mở slave '%s' thất bại: %s", slave_name, strerror(errno));
+        emit_log(&ctx, "[launcher]", msg, (size_t)n);
+        close(master_fd);
+        return -1;
+    }
+    tcsetattr(slave_fd, TCSANOW, &term);
+    ioctl(slave_fd, TIOCSWINSZ, &win);
     g_master_fd = master_fd;
 
     pid_t pid = fork();
