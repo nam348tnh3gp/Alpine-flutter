@@ -28,6 +28,11 @@ class _HomeScreenState extends State<HomeScreen> {
     super.initState();
     _proot = PRootService(onLog: (l) => _terminal.write('$l\r\n'));
     _checkInstalled();
+
+    // Kết nối input từ terminal tới service
+    _terminal.onInput = (data) {
+      _proot.sendInput(data);
+    };
   }
 
   @override
@@ -54,7 +59,6 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // 🔥 COPY LOG
   Future<void> _copyLog() async {
     final logs = _proot.getLogs();
     if (logs.isNotEmpty) {
@@ -65,7 +69,6 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // 🔥 CLEAR LOG
   void _clearLog() {
     _proot.clearLogs();
     _terminal.write('\r\n🗑️ Đã xóa log.\r\n');
@@ -87,6 +90,8 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     } catch (e) {
       _terminal.write('❌ LỖI khởi chạy: $e\r\n');
+    } finally {
+      setState(() => _running = false);
     }
   }
 
@@ -108,6 +113,8 @@ class _HomeScreenState extends State<HomeScreen> {
       await _openRealVnc();
     } catch (e) {
       _terminal.write('❌ LỖI khởi chạy GUI: $e\r\n');
+    } finally {
+      setState(() => _running = false);
     }
   }
 
@@ -126,13 +133,11 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('Alpine Runner (proot, no root)'),
         actions: [
-          // 🔥 Nút COPY LOG
           IconButton(
             icon: const Icon(Icons.copy),
             onPressed: _running ? _copyLog : null,
             tooltip: 'Copy log',
           ),
-          // 🔥 Nút CLEAR LOG
           IconButton(
             icon: const Icon(Icons.clear),
             onPressed: _running ? _clearLog : null,
