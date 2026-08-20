@@ -24,23 +24,26 @@ class _HomeScreenState extends State<HomeScreen> {
   RunMode? _mode;
   bool _running = false;
 
+  late final StreamSubscription<String> _inputSubscription;
+
   @override
   void initState() {
     super.initState();
     _proot = PRootService(onLog: (l) => _terminal.write('$l\r\n'));
     _checkInstalled();
+
+    // Lắng nghe dữ liệu nhập từ bàn phím trên terminal
+    _inputSubscription = _terminal.onInput.listen((data) {
+      // Gửi sang PTY (bất đồng bộ)
+      _proot.sendInput(data);
+    });
   }
 
   @override
   void dispose() {
+    _inputSubscription.cancel();
     _terminalFocusNode.dispose();
     super.dispose();
-  }
-
-  // Callback khi người dùng gõ trên terminal → gửi sang PTY
-  void _onInput(String data) {
-    // Gửi bất đồng bộ, không chặn UI
-    unawaited(_proot.sendInput(data));
   }
 
   Future<void> _checkInstalled() async {
@@ -156,7 +159,7 @@ class _HomeScreenState extends State<HomeScreen> {
               child: TerminalView(
                 _terminal,
                 focusNode: _terminalFocusNode,
-                onInput: _onInput, // 🔥 Truyền callback input tại đây
+                // KHÔNG truyền onInput ở đây
               ),
             ),
         ],
