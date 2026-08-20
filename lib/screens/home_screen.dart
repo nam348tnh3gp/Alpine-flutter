@@ -23,26 +23,29 @@ class _HomeScreenState extends State<HomeScreen> {
   RunMode? _mode;
   bool _running = false;
 
-  late final StreamSubscription<String> _inputSubscription;
-
   @override
   void initState() {
     super.initState();
-    _proot = PRootService(onLog: (l) => _terminal.write('$l\r\n'));
+    _proot = PRootService(
+      onLog: (l) => _terminal.write('$l\r\n'),
+    );
     _checkInstalled();
 
-    // ✅ Lắng nghe sự kiện nhập từ bàn phím và gửi sang PTY
-    _inputSubscription = _terminal.onInput.listen((data) {
+    // ✅ Gán callback onOutput để nhận dữ liệu từ bàn phím và gửi xuống PTY
+    _terminal.onOutput = (data) {
+      // Log để kiểm tra input có được gọi không (sẽ hiện trên terminal)
+      _terminal.write('\r\n[DEBUG] Keyboard input: $data\r\n');
       _proot.sendInput(data);
-    });
+    };
 
-    // ❌ KHÔNG dùng onOutput ở đây (nó dành cho output, không phải input)
-    // _terminal.onOutput = ... (xóa)
+    // Xử lý resize (nếu cần)
+    _terminal.onResize = (width, height, pixelWidth, pixelHeight) {
+      // Có thể gửi resize đến PTY qua JNI nếu cần
+    };
   }
 
   @override
   void dispose() {
-    _inputSubscription.cancel();
     _terminalFocusNode.dispose();
     super.dispose();
   }
