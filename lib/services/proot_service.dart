@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/services.dart';
 import 'package:tar/tar.dart';
 import 'package:http/http.dart' as http;
 import 'native_bridge.dart';
@@ -38,7 +39,11 @@ class FakeProcess implements Process {
   }
 
   @override
-  bool kill([ProcessSignal signal = ProcessSignal.sigterm]) => false;
+  bool kill([ProcessSignal signal = ProcessSignal.sigterm]) {
+    // Gọi JNI kill thực tế
+    ProotJNI.killProot();
+    return true;
+  }
 
   void addStdout(List<int> data) => _stdoutController.add(data);
   void addStderr(List<int> data) => _stderrController.add(data);
@@ -51,15 +56,17 @@ class PRootService {
   static const _alpineArchMap = {
     'arm64-v8a': 'aarch64',
     'armeabi-v7a': 'armv7',
+    // Nếu thêm ABI khác, cần cập nhật
   };
 
   final void Function(String line) onLog;
+  final void Function()? onProcessExited;
   Process? _currentProcess;
   final StringBuffer _logBuffer = StringBuffer();
   StreamSubscription<String>? _logSub;
   bool _running = false;
 
-  PRootService({required this.onLog});
+  PRootService({required this.onLog, this.onProcessExited});
 
   String getLogs() => _logBuffer.toString();
   void clearLogs() => _logBuffer.clear();
@@ -86,7 +93,10 @@ class PRootService {
 
   Future<void> bootstrap({required void Function(double) onProgress}) async {
     final abi = await NativeBridge.getAbi();
-    final alpineArch = _alpineArchMap[abi] ?? 'aarch64';
+    final alpineArch = _alpineArchMap[abi];
+    if (alpineArch == null) {
+      throw Exception('ABI không được hỗ trợ: $abi');
+    }
     final rootfs = await _rootfsDir();
     final filesDir = await NativeBridge.getFilesDir();
 
@@ -136,10 +146,19 @@ class PRootService {
           final target = header.linkName;
           if (target == null) break;
           Directory(outPath).parent.createSync(recursive: true);
-          final linkFile = Link(outPath);
-          if (linkFile.existsSync()) await linkFile.delete();
-          else if (File(outPath).existsSync()) File(outPath).deleteSync();
-          await linkFile.create(target, recursive: true);
+          // Xóa file/link cũ nếu tồn tại (kể cả dangling)
+          if (Link(outPath).existsSync() || File(outPath).existsSync()) {
+            try {
+              File(outPath).deleteSync();
+            } catch (_) {
+              Link(outPath).deleteSync();
+            }
+          }
+          try {
+            await Link(outPath).create(target, recursive: true);
+          } catch (e) {
+            _log('⚠️ Không tạo được symlink $outPath -> $target: $e');
+          }
           linkCount++;
           break;
         case TypeFlag.dir:
@@ -166,11 +185,24 @@ class PRootService {
           '${chmodResult.stderr}');
     }
 
+    // Copy script start-gui.sh vào rootfs
+    final scriptAsset = 'assets/rootfs-scripts/start-gui.sh';
+    final scriptDest = '$rootfs/usr/local/bin/start-gui.sh';
+    try {
+      final scriptContent = await rootBundle.loadString(scriptAsset);
+      await File(scriptDest).create(recursive: true);
+      await File(scriptDest).writeAsString(scriptContent);
+      await Process.run('chmod', ['+x', scriptDest]);
+      _log('✅ Đã copy start-gui.sh vào $scriptDest');
+    } catch (e) {
+      _log('⚠️ Không copy được start-gui.sh: $e');
+    }
+
     final shLink = Link('$rootfs/bin/sh');
     if (!shLink.existsSync()) {
       try {
         if (File('$rootfs/bin/sh').existsSync()) File('$rootfs/bin/sh').deleteSync();
-        shLink.createSync('busybox');
+        await shLink.create('busybox', recursive: true);
         _log('✅ Đã tạo /bin/sh -> busybox.');
       } catch (e) {
         _log('ℹ️ /bin/sh đã tồn tại từ tarball (bình thường).');
@@ -285,6 +317,7 @@ class PRootService {
       fake.closeStdout();
       fake.closeStderr();
       _running = false;
+      onProcessExited?.call();
     }
 
     _log('Process exited with code $exitCode');
@@ -293,16 +326,22 @@ class PRootService {
     return fake;
   }
 
-  /// Gửi dữ liệu từ bàn phím tới PTY (chỉ có hiệu lực khi process đang chạy)
   Future<void> sendInput(String data) async {
     if (!_running) return;
     final bytes = utf8.encode(data);
     await ProotJNI.writeToPty(bytes);
   }
 
+  Future<void> resizeTerminal(int width, int height) async {
+    if (!_running) return;
+    await ProotJNI.resizePty(width, height);
+  }
+
   void stop() {
-    _currentProcess?.kill(ProcessSignal.sigterm);
-    _currentProcess = null;
+    if (_currentProcess != null) {
+      _currentProcess?.kill();
+      _currentProcess = null;
+    }
     _running = false;
     _logSub?.cancel();
     _logSub = null;
