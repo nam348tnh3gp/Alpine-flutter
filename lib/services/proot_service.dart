@@ -293,6 +293,7 @@ class PRootService {
     return fake;
   }
 
+  /// Gửi dữ liệu từ bàn phím tới PTY (chỉ có hiệu lực khi process đang chạy)
   Future<void> sendInput(String data) async {
     if (!_running) return;
     final bytes = utf8.encode(data);
