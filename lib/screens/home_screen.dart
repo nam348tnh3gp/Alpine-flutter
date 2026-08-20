@@ -22,6 +22,7 @@ class _HomeScreenState extends State<HomeScreen> {
   double _progress = 0;
   RunMode? _mode;
   bool _running = false;
+  StreamSubscription<KeyEvent>? _keySubscription;
 
   @override
   void initState() {
@@ -29,14 +30,48 @@ class _HomeScreenState extends State<HomeScreen> {
     _proot = PRootService(onLog: (l) => _terminal.write('$l\r\n'));
     _checkInstalled();
 
-    // Kết nối input từ terminal tới service
-    _terminal.onInput = (data) {
-      _proot.sendInput(data);
-    };
+    // Lắng nghe bàn phím từ terminal và gửi sang PTY
+    _keySubscription = _terminal.onKey.listen((event) {
+      if (event.char != null) {
+        _proot.sendInput(event.char!);
+      } else {
+        // Xử lý các phím đặc biệt (không có ký tự)
+        switch (event.key) {
+          case 'Enter':
+            _proot.sendInput('\r');
+            break;
+          case 'Backspace':
+            _proot.sendInput('\x7f');
+            break;
+          case 'Tab':
+            _proot.sendInput('\t');
+            break;
+          case 'Escape':
+            _proot.sendInput('\x1b');
+            break;
+          case 'ArrowUp':
+            _proot.sendInput('\x1b[A');
+            break;
+          case 'ArrowDown':
+            _proot.sendInput('\x1b[B');
+            break;
+          case 'ArrowRight':
+            _proot.sendInput('\x1b[C');
+            break;
+          case 'ArrowLeft':
+            _proot.sendInput('\x1b[D');
+            break;
+          default:
+            // Bỏ qua các phím khác
+            break;
+        }
+      }
+    });
   }
 
   @override
   void dispose() {
+    _keySubscription?.cancel();
     _terminalFocusNode.dispose();
     super.dispose();
   }
