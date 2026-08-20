@@ -23,6 +23,12 @@ class ProotLauncher {
         @JvmStatic
         external fun writeToPty(data: ByteArray): Int
 
+        @JvmStatic
+        external fun killProot()
+
+        @JvmStatic
+        external fun resizePty(width: Int, height: Int)
+
         fun launch(
             context: Context,
             prootBin: String,
