@@ -10,7 +10,8 @@ import '../proot_jni.dart';
 // Giả lập Process object vì JNI không trả về Process
 class FakeProcess implements Process {
   final int _pid;
-  final int _exitCode;
+  int _exitCode;
+  final Completer<int> _exitCodeCompleter = Completer<int>();
   final StreamController<List<int>> _stdoutController = StreamController.broadcast();
   final StreamController<List<int>> _stderrController = StreamController.broadcast();
 
@@ -29,7 +30,18 @@ class FakeProcess implements Process {
   IOSink get stdin => IOSink(StreamController<List<int>>().sink);
 
   @override
-  Future<int> get exitCode => Future.value(_exitCode);
+  Future<int> get exitCode => _exitCodeCompleter.future;
+
+  // Trước đây exit code được truyền cứng vào constructor lúc proot ĐÃ
+  // xong, nên FakeProcess không thể được trả về sớm để UI theo dõi log
+  // trong lúc chạy. Giờ tạo FakeProcess trước, set exit code sau khi
+  // proot thực sự thoát.
+  void setExitCode(int code) {
+    _exitCode = code;
+    if (!_exitCodeCompleter.isCompleted) {
+      _exitCodeCompleter.complete(code);
+    }
+  }
 
   @override
   bool kill([ProcessSignal signal = ProcessSignal.sigterm]) => false;
@@ -245,17 +257,44 @@ class PRootService {
     _log('🚀 Khởi chạy JNI: $prootBin ${args.join(' ')}');
     _log('   PROOT_LOADER=$loaderPath');
 
-    final exitCode = await ProotJNI.runProot(
-      prootBin,
-      args,
-      env,
-    );
+    // Trả về FakeProcess NGAY để UI có thể lắng nghe stdout/stderr trong
+    // lúc proot đang chạy, thay vì đợi tới khi có exitCode mới biết gì.
+    final fake = FakeProcess(0, -1);
+    _currentProcess = fake;
+
+    // BUG CŨ: native đã có FakeProcess.addStdout()/addStderr() nhưng
+    // không có gì gọi tới -> không bao giờ có log ngoài exit code.
+    // Native giờ emit log real-time qua EventChannel 'alpine_runner/proot_logs';
+    // subscribe TRƯỚC khi gọi runProot() để không bỏ lỡ log của những
+    // dòng đầu (bootstrap/execve/loader).
+    final logSub = ProotJNI.onLog.listen((line) {
+      _log(line);
+      final bytes = utf8.encode('$line\n');
+      if (line.contains('[proot:stderr]') || line.contains('[launcher]')) {
+        fake.addStderr(bytes);
+        onStderr?.call(line);
+      } else {
+        fake.addStdout(bytes);
+        onStdout?.call(line);
+      }
+    });
+
+    late final int exitCode;
+    try {
+      exitCode = await ProotJNI.runProot(
+        prootBin,
+        args,
+        env,
+      );
+    } finally {
+      await logSub.cancel();
+      fake.closeStdout();
+      fake.closeStderr();
+    }
 
     _log('Process exited with code $exitCode');
+    fake.setExitCode(exitCode);
 
-    // Trả về FakeProcess để tương thích với UI hiện tại
-    final fake = FakeProcess(0, exitCode);
-    _currentProcess = fake;
     return fake;
   }
 
