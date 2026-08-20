@@ -10,32 +10,21 @@
 #include <poll.h>
 #include <signal.h>
 #include <android/log.h>
+#include <pty.h>
+#include <termios.h>
+#include <sys/ioctl.h>
 
 #define LOG_TAG "ProotLauncher"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
-// BUG GỐC: bản cũ chỉ fork()+execve() rồi waitpid(), không hề redirect
-// stdout/stderr của tiến trình con. Tiến trình con kế thừa fd 1/2 của
-// app Android (thường là /dev/null hoặc fd đã bị Zygote đóng), nên toàn
-// bộ log verbose của proot (kể cả cờ "-v 5" và lý do thật sự khiến
-// proot không exec được loader: sai path, sai kiến trúc ELF, lỗi
-// ptrace/seccomp...) bị mất hoàn toàn. JNI chỉ trả về mã exit code,
-// không có bất kỳ dòng log nào -> đúng như triệu chứng "chỉ có exit
-// code" được báo.
-//
-// Bản vá này: tạo 2 pipe cho stdout/stderr, dup2 vào tiến trình con,
-// đọc non-blocking bằng poll() ngay trên thread gọi JNI (không cần
-// AttachCurrentThread vì không tạo thread mới), và forward từng dòng
-// log về phía Kotlin qua callback Java `onLog(String)` NGAY LẬP TỨC
-// (không đợi proot thoát), để thấy được toàn bộ quá trình proot cố
-// gắng nạp loader.
-
 typedef struct {
     JNIEnv *env;
-    jobject callback;    // đối tượng Kotlin implement interface có method onLog(String)
+    jobject callback;
     jmethodID onLogMid;
 } LogCtx;
+
+static int g_master_fd = -1;
 
 static void emit_log(LogCtx *ctx, const char *prefix, const char *line, size_t len) {
     if (ctx->callback == NULL || ctx->onLogMid == NULL) {
@@ -54,13 +43,11 @@ static void emit_log(LogCtx *ctx, const char *prefix, const char *line, size_t l
     (*ctx->env)->DeleteLocalRef(ctx->env, jline);
 }
 
-// Đọc mọi thứ đang có trong fd (non-blocking), tách theo dòng, forward qua callback.
-// buf/buflen là bộ đệm dòng dở (chưa gặp '\n') được giữ lại giữa các lần gọi.
 static void drain_fd(int fd, LogCtx *ctx, const char *prefix, char *linebuf, size_t *linelen, size_t linecap) {
     char chunk[4096];
     for (;;) {
         ssize_t n = read(fd, chunk, sizeof(chunk));
-        if (n <= 0) break; // EOF hoặc EAGAIN (non-blocking)
+        if (n <= 0) break;
         for (ssize_t i = 0; i < n; i++) {
             char c = chunk[i];
             if (c == '\n') {
@@ -85,7 +72,6 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
     LogCtx ctx = {0};
     ctx.env = env;
     ctx.callback = logCallback;
-    ctx.onLogMid = NULL;
     if (logCallback != NULL) {
         jclass cbClass = (*env)->GetObjectClass(env, logCallback);
         ctx.onLogMid = (*env)->GetMethodID(env, cbClass, "onLog", "(Ljava/lang/String;)V");
@@ -108,11 +94,13 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         int n = snprintf(msg, sizeof(msg), "[launcher] Không tìm thấy proot binary tại '%s': %s (errno=%d)",
                           proot, strerror(errno), errno);
         emit_log(&ctx, "[launcher]", msg, (size_t)n);
+        return -1;
     } else if (!(st.st_mode & S_IXUSR)) {
         char msg[512];
         int n = snprintf(msg, sizeof(msg), "[launcher] '%s' tồn tại nhưng thiếu quyền execute (mode=%o)",
                           proot, st.st_mode & 0777);
         emit_log(&ctx, "[launcher]", msg, (size_t)n);
+        return -1;
     }
 
     int argc = (*env)->GetArrayLength(env, argsArray);
@@ -138,8 +126,6 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
     }
     envp[envc] = NULL;
 
-    // Log chi tiết argv/envp trước khi exec — hữu ích để xác nhận
-    // PROOT_LOADER trỏ đúng chỗ, LD_LIBRARY_PATH có libtalloc.so v.v.
     {
         char msg[4096];
         int off = snprintf(msg, sizeof(msg), "[launcher] exec: %s", argv[0]);
@@ -152,32 +138,52 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         }
     }
 
-    int outPipe[2], errPipe[2];
-    if (pipe(outPipe) != 0 || pipe(errPipe) != 0) {
-        char msg[256];
-        int n = snprintf(msg, sizeof(msg), "[launcher] pipe() thất bại: %s (errno=%d)", strerror(errno), errno);
-        emit_log(&ctx, "[launcher]", msg, (size_t)n);
-        return -1;
+    int master_fd, slave_fd;
+    struct termios term;
+    struct winsize win;
+    tcgetattr(STDIN_FILENO, &term);
+    win.ws_row = 30;
+    win.ws_col = 120;
+    win.ws_xpixel = 0;
+    win.ws_ypixel = 0;
+
+    if (openpty(&master_fd, &slave_fd, NULL, &term, &win) == -1) {
+        master_fd = posix_openpt(O_RDWR | O_NOCTTY);
+        if (master_fd == -1) {
+            char msg[256];
+            int n = snprintf(msg, sizeof(msg), "[launcher] posix_openpt thất bại: %s", strerror(errno));
+            emit_log(&ctx, "[launcher]", msg, (size_t)n);
+            return -1;
+        }
+        if (grantpt(master_fd) == -1 || unlockpt(master_fd) == -1) {
+            char msg[256];
+            int n = snprintf(msg, sizeof(msg), "[launcher] grantpt/unlockpt thất bại: %s", strerror(errno));
+            emit_log(&ctx, "[launcher]", msg, (size_t)n);
+            close(master_fd);
+            return -1;
+        }
+        slave_fd = open(ptsname(master_fd), O_RDWR | O_NOCTTY);
+        if (slave_fd == -1) {
+            char msg[256];
+            int n = snprintf(msg, sizeof(msg), "[launcher] mở slave thất bại: %s", strerror(errno));
+            emit_log(&ctx, "[launcher]", msg, (size_t)n);
+            close(master_fd);
+            return -1;
+        }
     }
+
+    g_master_fd = master_fd;
 
     pid_t pid = fork();
     if (pid == 0) {
-        // ---- Tiến trình con ----
-        dup2(outPipe[1], STDOUT_FILENO);
-        dup2(errPipe[1], STDERR_FILENO);
-        close(outPipe[0]); close(outPipe[1]);
-        close(errPipe[0]); close(errPipe[1]);
-
+        close(master_fd);
+        setsid();
+        ioctl(slave_fd, TIOCSCTTY, 0);
+        dup2(slave_fd, STDIN_FILENO);
+        dup2(slave_fd, STDOUT_FILENO);
+        dup2(slave_fd, STDERR_FILENO);
+        close(slave_fd);
         execve(proot, argv, envp);
-
-        // Chỉ tới đây khi execve() thất bại - đây chính là điểm quan
-        // trọng nhất để chẩn đoán "proot không dùng được loader": nếu
-        // proot binary tự nó exec được nhưng loader thì không, lỗi sẽ
-        // không xuất hiện ở đây mà xuất hiện trong stderr của proot ở
-        // trên (loader là proot tự fork/exec bên trong process của nó).
-        // Nếu lỗi xuất hiện Ở ĐÂY nghĩa là chính proot binary (không
-        // phải loader) mới là thứ không exec được (permission, ELF sai
-        // kiến trúc, ENOENT do path sai...).
         fprintf(stderr, "[launcher] execve('%s') thất bại: %s (errno=%d)\n",
                 proot, strerror(errno), errno);
         fflush(stderr);
@@ -186,34 +192,23 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         char msg[256];
         int n = snprintf(msg, sizeof(msg), "[launcher] fork() thất bại: %s (errno=%d)", strerror(errno), errno);
         emit_log(&ctx, "[launcher]", msg, (size_t)n);
-        close(outPipe[0]); close(outPipe[1]);
-        close(errPipe[0]); close(errPipe[1]);
+        close(master_fd);
+        close(slave_fd);
         return -1;
     }
 
-    // ---- Tiến trình cha ----
-    close(outPipe[1]);
-    close(errPipe[1]);
-    fcntl(outPipe[0], F_SETFL, O_NONBLOCK);
-    fcntl(errPipe[0], F_SETFL, O_NONBLOCK);
+    close(slave_fd);
+    fcntl(master_fd, F_SETFL, O_NONBLOCK);
 
-    char outLine[4096]; size_t outLen = 0;
-    char errLine[4096]; size_t errLen = 0;
-
+    char linebuf[4096]; size_t linelen = 0;
     int status = 0;
     int childExited = 0;
     int exitCode = -1;
 
     while (!childExited) {
-        struct pollfd fds[2] = {
-            { outPipe[0], POLLIN, 0 },
-            { errPipe[0], POLLIN, 0 },
-        };
-        poll(fds, 2, 100); // 100ms: vừa đọc log gần real-time vừa không busy-loop
-
-        drain_fd(outPipe[0], &ctx, "[proot:stdout]", outLine, &outLen, sizeof(outLine));
-        drain_fd(errPipe[0], &ctx, "[proot:stderr]", errLine, &errLen, sizeof(errLine));
-
+        struct pollfd fds[1] = { { master_fd, POLLIN, 0 } };
+        poll(fds, 1, 100);
+        drain_fd(master_fd, &ctx, "[pty]", linebuf, &linelen, sizeof(linebuf));
         pid_t r = waitpid(pid, &status, WNOHANG);
         if (r == pid) {
             childExited = 1;
@@ -225,12 +220,9 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         }
     }
 
-    // Đọc nốt phần dữ liệu còn lại sau khi tiến trình con đã thoát
-    // (tránh mất vài dòng log cuối do timing của poll()).
-    drain_fd(outPipe[0], &ctx, "[proot:stdout]", outLine, &outLen, sizeof(outLine));
-    drain_fd(errPipe[0], &ctx, "[proot:stderr]", errLine, &errLen, sizeof(errLine));
-    if (outLen > 0) emit_log(&ctx, "[proot:stdout]", outLine, outLen);
-    if (errLen > 0) emit_log(&ctx, "[proot:stderr]", errLine, errLen);
+    drain_fd(master_fd, &ctx, "[pty]", linebuf, &linelen, sizeof(linebuf));
+    if (linelen > 0) emit_log(&ctx, "[pty]", linebuf, linelen);
+    close(master_fd);
 
     if (WIFEXITED(status)) {
         exitCode = WEXITSTATUS(status);
@@ -246,9 +238,6 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         exitCode = 128 + WTERMSIG(status);
     }
 
-    close(outPipe[0]);
-    close(errPipe[0]);
-
     free((void *)proot);
     for (int i = 0; i < argc + 1; i++) free(argv[i]);
     free(argv);
@@ -256,4 +245,18 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
     free(envp);
 
     return exitCode;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_example_alpinerunner_ProotLauncher_writeToPty(
+    JNIEnv *env,
+    jobject thiz,
+    jbyteArray data) {
+    if (g_master_fd == -1) return -1;
+    jsize len = (*env)->GetArrayLength(env, data);
+    jbyte *bytes = (*env)->GetByteArrayElements(env, data, NULL);
+    if (bytes == NULL) return -1;
+    ssize_t written = write(g_master_fd, bytes, len);
+    (*env)->ReleaseByteArrayElements(env, data, bytes, JNI_ABORT);
+    return (jint)written;
 }
