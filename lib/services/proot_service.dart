@@ -6,8 +6,6 @@ import 'package:http/http.dart' as http;
 import 'native_bridge.dart';
 import '../proot_jni.dart';
 
-// ===== FAKE PROCESS =====
-// Giả lập Process object vì JNI không trả về Process
 class FakeProcess implements Process {
   final int _pid;
   int _exitCode;
@@ -32,10 +30,6 @@ class FakeProcess implements Process {
   @override
   Future<int> get exitCode => _exitCodeCompleter.future;
 
-  // Trước đây exit code được truyền cứng vào constructor lúc proot ĐÃ
-  // xong, nên FakeProcess không thể được trả về sớm để UI theo dõi log
-  // trong lúc chạy. Giờ tạo FakeProcess trước, set exit code sau khi
-  // proot thực sự thoát.
   void setExitCode(int code) {
     _exitCode = code;
     if (!_exitCodeCompleter.isCompleted) {
@@ -46,14 +40,12 @@ class FakeProcess implements Process {
   @override
   bool kill([ProcessSignal signal = ProcessSignal.sigterm]) => false;
 
-  // Hỗ trợ ghi output từ JNI nếu có callback
   void addStdout(List<int> data) => _stdoutController.add(data);
   void addStderr(List<int> data) => _stderrController.add(data);
   void closeStdout() => _stdoutController.close();
   void closeStderr() => _stderrController.close();
 }
 
-// ===== PRootService =====
 class PRootService {
   static const _alpineVersion = '3.19.9';
   static const _alpineArchMap = {
@@ -64,6 +56,8 @@ class PRootService {
   final void Function(String line) onLog;
   Process? _currentProcess;
   final StringBuffer _logBuffer = StringBuffer();
+  StreamSubscription<String>? _logSub;
+  bool _running = false;
 
   PRootService({required this.onLog});
 
@@ -166,20 +160,6 @@ class PRootService {
     await File(tarGzPath).delete().catchError((_) => File(tarGzPath));
 
     _log('🔧 Cấp quyền execute cho toàn bộ rootfs...');
-    // BUG CŨ: chỉ chmod +x cho 'bin','sbin','usr/bin','usr/sbin','usr/lib/apk'.
-    // Vì package:tar giải nén qua File.openWrite() (KHÔNG giữ mode bit gốc
-    // trong tarball), MỌI file trong rootfs đều thiếu +x trừ khi chmod thủ
-    // công. Danh sách trên bỏ sót 'lib/' - nơi chứa ELF interpreter musl
-    // (vd. /lib/ld-musl-aarch64.so.1). Khi exec một binary động, kernel
-    // Linux còn kiểm tra quyền +x của chính file interpreter (PT_INTERP)
-    // qua open_exec(), không chỉ của binary chính -> thiếu +x ở đây khiến
-    // MỌI binary liên kết động trong rootfs (gồm cả busybox) không exec
-    // được, dù đường dẫn được proot dịch (translate) hoàn toàn chính xác.
-    // Chmod đệ quy toàn bộ rootfs một lần để không sót thư mục nào nữa.
-    // Lưu ý: dùng 'x' thường (không phải 'X') — 'X' chỉ set +x cho file ĐÃ
-    // có sẵn +x từ trước, mà file do Dart ghi ra (File.openWrite) không có
-    // bit +x nào cả nên 'X' sẽ không set được gì. Set +x cho toàn bộ file
-    // (kể cả file dữ liệu/config) là vô hại trên rootfs dùng riêng cho app.
     final chmodResult = await Process.run('chmod', ['-R', 'a+rx', rootfs]);
     if (chmodResult.exitCode != 0) {
       _log('⚠️ chmod -R a+rX $rootfs thất bại (exit ${chmodResult.exitCode}): '
@@ -207,12 +187,16 @@ class PRootService {
     _log('✅ Hoàn tất cài đặt Alpine rootfs tại: $rootfs');
   }
 
-  // ---- Gọi JNI thay vì Process.start ----
   Future<Process> start({
     required List<String> command,
     void Function(String)? onStdout,
     void Function(String)? onStderr,
   }) async {
+    if (_running) {
+      throw Exception('PRootService đang chạy.');
+    }
+    _running = true;
+
     final libDir = await NativeBridge.getNativeLibraryDir();
     final rootfs = await _rootfsDir();
     final filesDir = await NativeBridge.getFilesDir();
@@ -236,7 +220,6 @@ class PRootService {
 
     if (command.isEmpty) command = ['/bin/sh', '-l'];
 
-    // 🔥 Thêm -v 5 để debug
     final args = <String>[
       '-v', '5',
       '-0',
@@ -271,25 +254,21 @@ class PRootService {
     _log('🚀 Khởi chạy JNI: $prootBin ${args.join(' ')}');
     _log('   PROOT_LOADER=$loaderPath');
 
-    // Trả về FakeProcess NGAY để UI có thể lắng nghe stdout/stderr trong
-    // lúc proot đang chạy, thay vì đợi tới khi có exitCode mới biết gì.
     final fake = FakeProcess(0, -1);
     _currentProcess = fake;
 
-    // BUG CŨ: native đã có FakeProcess.addStdout()/addStderr() nhưng
-    // không có gì gọi tới -> không bao giờ có log ngoài exit code.
-    // Native giờ emit log real-time qua EventChannel 'alpine_runner/proot_logs';
-    // subscribe TRƯỚC khi gọi runProot() để không bỏ lỡ log của những
-    // dòng đầu (bootstrap/execve/loader).
-    final logSub = ProotJNI.onLog.listen((line) {
+    _logSub = ProotJNI.onLog.listen((line) {
       _log(line);
       final bytes = utf8.encode('$line\n');
-      if (line.contains('[proot:stderr]') || line.contains('[launcher]')) {
+      if (line.startsWith('[pty]')) {
+        String content = line.substring(5).trim();
+        if (content.isNotEmpty) {
+          fake.addStdout(utf8.encode(content + '\n'));
+          onStdout?.call(content);
+        }
+      } else {
         fake.addStderr(bytes);
         onStderr?.call(line);
-      } else {
-        fake.addStdout(bytes);
-        onStdout?.call(line);
       }
     });
 
@@ -301,9 +280,11 @@ class PRootService {
         env,
       );
     } finally {
-      await logSub.cancel();
+      await _logSub?.cancel();
+      _logSub = null;
       fake.closeStdout();
       fake.closeStderr();
+      _running = false;
     }
 
     _log('Process exited with code $exitCode');
@@ -312,8 +293,17 @@ class PRootService {
     return fake;
   }
 
+  Future<void> sendInput(String data) async {
+    if (!_running) return;
+    final bytes = utf8.encode(data);
+    await ProotJNI.writeToPty(bytes);
+  }
+
   void stop() {
     _currentProcess?.kill(ProcessSignal.sigterm);
     _currentProcess = null;
+    _running = false;
+    _logSub?.cancel();
+    _logSub = null;
   }
 }
