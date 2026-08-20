@@ -165,11 +165,25 @@ class PRootService {
 
     await File(tarGzPath).delete().catchError((_) => File(tarGzPath));
 
-    _log('🔧 Cấp quyền execute cho binary trong rootfs...');
-    for (final binDir in ['bin', 'sbin', 'usr/bin', 'usr/sbin', 'usr/lib/apk']) {
-      final dir = Directory('$rootfs/$binDir');
-      if (!dir.existsSync()) continue;
-      await Process.run('chmod', ['-R', 'a+x', dir.path]);
+    _log('🔧 Cấp quyền execute cho toàn bộ rootfs...');
+    // BUG CŨ: chỉ chmod +x cho 'bin','sbin','usr/bin','usr/sbin','usr/lib/apk'.
+    // Vì package:tar giải nén qua File.openWrite() (KHÔNG giữ mode bit gốc
+    // trong tarball), MỌI file trong rootfs đều thiếu +x trừ khi chmod thủ
+    // công. Danh sách trên bỏ sót 'lib/' - nơi chứa ELF interpreter musl
+    // (vd. /lib/ld-musl-aarch64.so.1). Khi exec một binary động, kernel
+    // Linux còn kiểm tra quyền +x của chính file interpreter (PT_INTERP)
+    // qua open_exec(), không chỉ của binary chính -> thiếu +x ở đây khiến
+    // MỌI binary liên kết động trong rootfs (gồm cả busybox) không exec
+    // được, dù đường dẫn được proot dịch (translate) hoàn toàn chính xác.
+    // Chmod đệ quy toàn bộ rootfs một lần để không sót thư mục nào nữa.
+    // Lưu ý: dùng 'x' thường (không phải 'X') — 'X' chỉ set +x cho file ĐÃ
+    // có sẵn +x từ trước, mà file do Dart ghi ra (File.openWrite) không có
+    // bit +x nào cả nên 'X' sẽ không set được gì. Set +x cho toàn bộ file
+    // (kể cả file dữ liệu/config) là vô hại trên rootfs dùng riêng cho app.
+    final chmodResult = await Process.run('chmod', ['-R', 'a+rx', rootfs]);
+    if (chmodResult.exitCode != 0) {
+      _log('⚠️ chmod -R a+rX $rootfs thất bại (exit ${chmodResult.exitCode}): '
+          '${chmodResult.stderr}');
     }
 
     final shLink = Link('$rootfs/bin/sh');
