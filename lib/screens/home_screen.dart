@@ -6,25 +6,6 @@ import '../services/proot_service.dart';
 
 enum RunMode { cli, gui }
 
-/// Handler nhận sự kiện bàn phím từ terminal và gửi xuống PTY
-class _PtyInputHandler implements TerminalInputHandler {
-  final PRootService _proot;
-
-  _PtyInputHandler(this._proot);
-
-  @override
-  String? call(TerminalKeyboardEvent event) {
-    // Lấy ký tự từ sự kiện (nếu có)
-    final character = event.character;
-    if (character != null && character.isNotEmpty) {
-      // Gửi sang PTY (không chờ, để không chặn luồng sự kiện)
-      _proot.sendInput(character);
-    }
-    // Trả về null để terminal không xử lý thêm
-    return null;
-  }
-}
-
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
@@ -42,16 +23,21 @@ class _HomeScreenState extends State<HomeScreen> {
   RunMode? _mode;
   bool _running = false;
 
-  late final _PtyInputHandler _inputHandler;
-
   @override
   void initState() {
     super.initState();
     _proot = PRootService(onLog: (l) => _terminal.write('$l\r\n'));
     _checkInstalled();
 
-    // Tạo handler gắn với service
-    _inputHandler = _PtyInputHandler(_proot);
+    // ✅ Gán callback onOutput để nhận dữ liệu từ bàn phím và gửi xuống PTY
+    _terminal.onOutput = (data) {
+      _proot.sendInput(data);
+    };
+
+    // Nếu cần xử lý thay đổi kích thước terminal (gửi xuống PTY)
+    _terminal.onResize = (width, height, pixelWidth, pixelHeight) {
+      // Có thể gọi resize trên PTY nếu cần (hiện tại chưa dùng)
+    };
   }
 
   @override
@@ -173,7 +159,7 @@ class _HomeScreenState extends State<HomeScreen> {
               child: TerminalView(
                 _terminal,
                 focusNode: _terminalFocusNode,
-                inputHandler: _inputHandler, // ✅ Truyền handler nhận input
+                // KHÔNG truyền onInput hay inputHandler
                 autofocus: true,
               ),
             ),
