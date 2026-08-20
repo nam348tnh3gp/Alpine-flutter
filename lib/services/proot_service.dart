@@ -253,7 +253,6 @@ class PRootService {
     if (command.isEmpty) command = ['/bin/sh', '-l'];
 
     final args = <String>[
-      '-v', '1',
       '-0',
       '--link2symlink',
       '--kill-on-exit',
