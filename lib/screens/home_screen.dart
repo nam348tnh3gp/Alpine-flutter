@@ -28,24 +28,33 @@ class _HomeScreenState extends State<HomeScreen> {
     super.initState();
     _proot = PRootService(
       onLog: (l) => _terminal.write('$l\r\n'),
+      onProcessExited: () {
+        // Khi process kết thúc, reset mode để hiển thị lại nút chọn
+        if (mounted) {
+          setState(() {
+            _running = false;
+            _mode = null;
+          });
+        }
+      },
     );
     _checkInstalled();
 
-    // ✅ Gán callback onOutput để nhận dữ liệu từ bàn phím và gửi xuống PTY
+    // Nhận input từ bàn phím và gửi xuống PTY
     _terminal.onOutput = (data) {
-      // Log để kiểm tra input có được gọi không (sẽ hiện trên terminal)
-      _terminal.write('\r\n[DEBUG] Keyboard input: $data\r\n');
       _proot.sendInput(data);
     };
 
-    // Xử lý resize (nếu cần)
+    // Khi terminal thay đổi kích thước, gửi sang PTY
     _terminal.onResize = (width, height, pixelWidth, pixelHeight) {
-      // Có thể gửi resize đến PTY qua JNI nếu cần
+      _proot.resizeTerminal(width, height);
     };
   }
 
   @override
   void dispose() {
+    // Dừng tiến trình nếu còn chạy
+    _proot.stop();
     _terminalFocusNode.dispose();
     super.dispose();
   }
@@ -99,8 +108,10 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     } catch (e) {
       _terminal.write('❌ LỖI khởi chạy: $e\r\n');
-    } finally {
-      setState(() => _running = false);
+      setState(() {
+        _running = false;
+        _mode = null;
+      });
     }
   }
 
@@ -113,17 +124,24 @@ class _HomeScreenState extends State<HomeScreen> {
       FocusScope.of(context).requestFocus(_terminalFocusNode);
     });
     try {
-      await _proot.start(
+      // start() sẽ trả về khi process kết thúc, nhưng GUI cần chạy lâu dài.
+      // Vì thế ta chạy start trong một future riêng, và chờ VNC sau 2s.
+      final processFuture = _proot.start(
         command: ['/bin/sh', '/usr/local/bin/start-gui.sh'],
         onStdout: (s) => _terminal.write(s),
         onStderr: (s) => _terminal.write(s),
       );
+      // Chờ 2 giây để VNC server khởi động
       await Future.delayed(const Duration(seconds: 2));
       await _openRealVnc();
+      // Bây giờ chờ process kết thúc (nếu có lỗi, UI sẽ hiển thị)
+      await processFuture;
     } catch (e) {
       _terminal.write('❌ LỖI khởi chạy GUI: $e\r\n');
-    } finally {
-      setState(() => _running = false);
+      setState(() {
+        _running = false;
+        _mode = null;
+      });
     }
   }
 
@@ -136,20 +154,39 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  /// Dừng tiến trình đang chạy (nếu có)
+  void _stopProcess() {
+    _proot.stop();
+    setState(() {
+      _running = false;
+      _mode = null;
+    });
+    _terminal.write('\r\n🛑 Đã yêu cầu dừng tiến trình.\r\n');
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Alpine Runner (proot, no root)'),
         actions: [
+          // Nút Stop luôn hiện khi đang chạy
+          if (_running)
+            IconButton(
+              icon: const Icon(Icons.stop),
+              onPressed: _stopProcess,
+              tooltip: 'Dừng tiến trình',
+            ),
+          // Nút Copy Log luôn bấm được (không phụ thuộc _running)
           IconButton(
             icon: const Icon(Icons.copy),
-            onPressed: _running ? _copyLog : null,
+            onPressed: _copyLog,
             tooltip: 'Copy log',
           ),
+          // Nút Clear Log luôn bấm được
           IconButton(
             icon: const Icon(Icons.clear),
-            onPressed: _running ? _clearLog : null,
+            onPressed: _clearLog,
             tooltip: 'Clear log',
           ),
         ],
@@ -157,7 +194,9 @@ class _HomeScreenState extends State<HomeScreen> {
       body: Column(
         children: [
           if (!_installed) _buildInstallPanel(),
-          if (_installed && _mode == null) _buildModePicker(),
+          // Chỉ hiển thị nút chọn mode khi đã cài và chưa chạy
+          if (_installed && _mode == null && !_running) _buildModePicker(),
+          // Khi đang chạy, hiển thị terminal
           if (_running)
             Expanded(
               child: TerminalView(
@@ -204,12 +243,12 @@ class _HomeScreenState extends State<HomeScreen> {
           FilledButton.icon(
             onPressed: _launchCli,
             icon: const Icon(Icons.terminal),
-            label: const Text('🖥️ CLI'),
+            label: const Text('CLI'),
           ),
           FilledButton.icon(
             onPressed: _launchGui,
             icon: const Icon(Icons.desktop_windows),
-            label: const Text('🖥️ GUI (VNC)'),
+            label: const Text('GUI (VNC)'),
           ),
         ],
       ),
