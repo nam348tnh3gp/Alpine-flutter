@@ -32,4 +32,15 @@ class ProotJNI {
     });
     return result as int;
   }
+
+  static Future<void> killProot() async {
+    await _channel.invokeMethod('killProot');
+  }
+
+  static Future<void> resizePty(int width, int height) async {
+    await _channel.invokeMethod('resizePty', {
+      'width': width,
+      'height': height,
+    });
+  }
 }
