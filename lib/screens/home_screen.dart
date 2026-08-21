@@ -7,6 +7,34 @@ import '../services/proot_service.dart';
 
 enum RunMode { cli, gui }
 
+/// Đối tượng đại diện cho một phiên terminal (tab)
+class TerminalTab {
+  final Terminal terminal;
+  final TerminalController controller;
+  final FocusNode focusNode;
+  final PRootService proot;
+
+  bool running = false;
+  bool stopping = false;
+  RunMode? mode;
+
+  // Toggle modifier keys cho phiên này
+  bool ctrlActive = false;
+  bool altActive = false;
+
+  TerminalTab()
+      : terminal = Terminal(maxLines: 5000),
+        controller = TerminalController(),
+        focusNode = FocusNode(),
+        proot = PRootService(onLog: (l) => terminal.write('$l\r\n'));
+
+  void dispose() {
+    proot.stop();
+    controller.dispose();
+    focusNode.dispose();
+  }
+}
+
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
@@ -15,29 +43,23 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  late final PRootService _proot;
-  final Terminal _terminal = Terminal(maxLines: 5000);
-  final TerminalController _terminalController = TerminalController();
-  final FocusNode _terminalFocusNode = FocusNode();
+  final List<TerminalTab> _tabs = [];
+  int? _currentTabIndex;
 
   bool _installed = false;
   bool _installing = false;
   double _progress = 0;
-  RunMode? _mode;
-  bool _running = false;
-  bool _stopping = false;
-
-  // Toggle modifier keys
-  bool _ctrlActive = false;
-  bool _altActive = false;
 
   String get _appBarTitle {
     if (!_installed) return 'Alpine Runner - Chưa cài';
     if (_installing) return 'Alpine Runner - Đang cài đặt...';
-    if (_running) {
-      return _mode == RunMode.cli
-          ? 'Alpine Runner - CLI đang chạy'
-          : 'Alpine Runner - GUI đang chạy';
+    if (_currentTabIndex != null && _tabs.isNotEmpty) {
+      final tab = _tabs[_currentTabIndex!];
+      if (tab.running) {
+        return tab.mode == RunMode.cli
+            ? 'Alpine Runner - CLI đang chạy'
+            : 'Alpine Runner - GUI đang chạy';
+      }
     }
     return 'Alpine Runner (proot, no root)';
   }
@@ -45,81 +67,225 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
-    _proot = PRootService(
-      onLog: (l) => _terminal.write('$l\r\n'),
-      onProcessExited: () {
-        if (mounted) {
-          setState(() {
-            _running = false;
-            _mode = null;
-            _stopping = false;
-          });
-        }
-      },
-    );
     _checkInstalled();
-
-    _terminal.onOutput = (data) {
-      if (_ctrlActive) {
-        _proot.sendInput(_applyCtrl(data));
-      } else if (_altActive) {
-        _proot.sendInput(_applyAlt(data));
-      } else {
-        _proot.sendInput(data);
-      }
-    };
-
-    _terminal.onResize = (width, height, pixelWidth, pixelHeight) {
-      _proot.resizeTerminal(width, height);
-    };
   }
 
   @override
   void dispose() {
-    _proot.stop();
-    _terminalController.dispose();
-    _terminalFocusNode.dispose();
+    for (var tab in _tabs) {
+      tab.dispose();
+    }
     super.dispose();
   }
 
+  // ==================== Kiểm tra & cài đặt rootfs ====================
+
   Future<void> _checkInstalled() async {
-    final ok = await _proot.isInstalled();
+    // Dùng một instance tạm để kiểm tra (vì rootfs dùng chung)
+    final tempService = PRootService(onLog: (_) {});
+    final ok = await tempService.isInstalled();
     if (mounted) setState(() => _installed = ok);
   }
 
   Future<void> _ensureInstalled() async {
     if (_installed) return;
     setState(() => _installing = true);
+    final tempService = PRootService(
+      onLog: (l) {
+        // Hiển thị log cài đặt vào terminal đầu tiên nếu có, hoặc tạo tab tạm
+        if (_tabs.isNotEmpty) {
+          _tabs.first.terminal.write('$l\r\n');
+        } else {
+          // Tạo một tab tạm để hiển thị log cài đặt
+          final tab = TerminalTab();
+          setState(() {
+            _tabs.add(tab);
+            _currentTabIndex = _tabs.length - 1;
+          });
+          tab.terminal.write('$l\r\n');
+        }
+      },
+    );
     try {
-      await _proot.bootstrap(onProgress: (p) {
+      await tempService.bootstrap(onProgress: (p) {
         if (mounted) setState(() => _progress = p);
       });
       if (mounted) setState(() => _installed = true);
     } catch (e) {
-      _terminal.write('❌ LỖI cài đặt: $e\r\n');
+      if (_tabs.isNotEmpty) {
+        _tabs.first.terminal.write('❌ LỖI cài đặt: $e\r\n');
+      }
       _showErrorSnackBar('Lỗi cài đặt: $e');
     } finally {
       if (mounted) setState(() => _installing = false);
     }
   }
 
-  Future<void> _copyLog() async {
-    final logs = _proot.getLogs();
-    if (logs.isNotEmpty) {
-      await Clipboard.setData(ClipboardData(text: logs));
-      _terminal.write('\r\n📋 Đã copy log vào clipboard!\r\n');
-      _showSnackBar('📋 Đã copy log vào clipboard!');
-    } else {
-      _terminal.write('\r\n⚠️ Không có log để copy.\r\n');
-      _showSnackBar('⚠️ Không có log để copy.');
+  // ==================== Quản lý tab & phiên ====================
+
+  Future<TerminalTab> _createNewTab() async {
+    final tab = TerminalTab();
+    setState(() {
+      _tabs.add(tab);
+      _currentTabIndex = _tabs.length - 1;
+    });
+
+    // Kết nối terminal I/O cho tab
+    tab.terminal.onOutput = (data) {
+      if (tab.ctrlActive) {
+        tab.proot.sendInput(_applyCtrl(data));
+      } else if (tab.altActive) {
+        tab.proot.sendInput(_applyAlt(data));
+      } else {
+        tab.proot.sendInput(data);
+      }
+    };
+
+    tab.terminal.onResize = (width, height, pixelWidth, pixelHeight) {
+      tab.proot.resizeTerminal(width, height);
+    };
+
+    // Xử lý khi process thoát
+    tab.proot.onProcessExited = () {
+      if (mounted) {
+        setState(() {
+          tab.running = false;
+          tab.mode = null;
+          tab.stopping = false;
+        });
+      }
+    };
+
+    return tab;
+  }
+
+  Future<void> _launchCliForTab(TerminalTab tab) async {
+    if (tab.running || tab.stopping) return;
+    setState(() {
+      tab.running = true;
+      tab.mode = RunMode.cli;
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) FocusScope.of(context).requestFocus(tab.focusNode);
+    });
+
+    await Future.delayed(const Duration(milliseconds: 50));
+
+    final rows = tab.terminal.viewHeight > 0 ? tab.terminal.viewHeight : 24;
+    final cols = tab.terminal.viewWidth > 0 ? tab.terminal.viewWidth : 80;
+
+    try {
+      await tab.proot.start(
+        command: ['/bin/sh', '-l'],
+        onStdout: (s) => tab.terminal.write(_sanitizeTerminalOutput(s)),
+        rows: rows,
+        cols: cols,
+      );
+    } catch (e) {
+      tab.terminal.write('❌ LỖI khởi chạy CLI: $e\r\n');
+      _showErrorSnackBar('Lỗi khởi chạy CLI: $e');
+      if (mounted) {
+        setState(() {
+          tab.running = false;
+          tab.mode = null;
+        });
+      }
     }
   }
 
-  void _clearLog() {
-    _proot.clearLogs();
-    _terminal.write('\r\n🗑️ Đã xóa log.\r\n');
-    _showSnackBar('🗑️ Đã xóa log.');
+  Future<void> _launchGuiForTab(TerminalTab tab) async {
+    if (tab.running || tab.stopping) return;
+    setState(() {
+      tab.running = true;
+      tab.mode = RunMode.gui;
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) FocusScope.of(context).requestFocus(tab.focusNode);
+    });
+
+    await Future.delayed(const Duration(milliseconds: 50));
+
+    final rows = tab.terminal.viewHeight > 0 ? tab.terminal.viewHeight : 24;
+    final cols = tab.terminal.viewWidth > 0 ? tab.terminal.viewWidth : 80;
+
+    try {
+      final processFuture = tab.proot.start(
+        command: ['/bin/sh', '/usr/local/bin/start-gui.sh'],
+        onStdout: (s) => tab.terminal.write(_sanitizeTerminalOutput(s)),
+        rows: rows,
+        cols: cols,
+      );
+      await Future.delayed(const Duration(seconds: 2));
+      await _openRealVnc();
+      await processFuture;
+    } catch (e) {
+      tab.terminal.write('❌ LỖI khởi chạy GUI: $e\r\n');
+      _showErrorSnackBar('Lỗi khởi chạy GUI: $e');
+      if (mounted) {
+        setState(() {
+          tab.running = false;
+          tab.mode = null;
+        });
+      }
+    }
   }
+
+  Future<void> _openRealVnc() async {
+    final uri = Uri.parse('vnc://127.0.0.1:5900');
+    if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+      final tab = _tabs.isNotEmpty ? _tabs[_currentTabIndex!] : null;
+      tab?.terminal.write(
+          '\r\n📱 Không mở được RealVNC Viewer. Hãy cài app "RealVNC Viewer" '
+          'từ Play Store rồi kết nối thủ công tới 127.0.0.1:5900\r\n');
+      _showSnackBar('Không mở được RealVNC Viewer. Vui lòng kết nối thủ công.');
+    }
+  }
+
+  /// Tạo phiên mới (tab mới và chạy CLI)
+  Future<void> _newSession() async {
+    final tab = await _createNewTab();
+    await _launchCliForTab(tab);
+  }
+
+  void _stopCurrentTab() {
+    if (_currentTabIndex == null || _tabs.isEmpty) return;
+    final tab = _tabs[_currentTabIndex!];
+    if (!tab.running || tab.stopping) return;
+    setState(() {
+      tab.stopping = true;
+    });
+    tab.proot.stop();
+    tab.terminal.write('\r\n🛑 Đã yêu cầu dừng tiến trình.\r\n');
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted && tab.stopping) {
+        setState(() {
+          tab.stopping = false;
+          tab.running = false;
+          tab.mode = null;
+        });
+      }
+    });
+  }
+
+  void _closeCurrentTab() {
+    if (_currentTabIndex == null || _tabs.isEmpty) return;
+    final tab = _tabs[_currentTabIndex!];
+    tab.dispose();
+    setState(() {
+      _tabs.removeAt(_currentTabIndex!);
+      if (_tabs.isEmpty) {
+        _currentTabIndex = null;
+      } else {
+        _currentTabIndex = (_currentTabIndex! >= _tabs.length)
+            ? _tabs.length - 1
+            : _currentTabIndex;
+      }
+    });
+  }
+
+  // ==================== Các tiện ích UI ====================
 
   void _showSnackBar(String message) {
     if (!mounted) return;
@@ -139,106 +305,119 @@ class _HomeScreenState extends State<HomeScreen> {
       ));
   }
 
-  Future<void> _launchCli() async {
-    if (_running || _stopping) return;
-    setState(() {
-      _mode = RunMode.cli;
-      _running = true;
-    });
-
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) FocusScope.of(context).requestFocus(_terminalFocusNode);
-    });
-
-    await Future.delayed(const Duration(milliseconds: 50));
-
-    final rows = _terminal.viewHeight > 0 ? _terminal.viewHeight : 24;
-    final cols = _terminal.viewWidth > 0 ? _terminal.viewWidth : 80;
-
-    try {
-      await _proot.start(
-        command: ['/bin/sh', '-l'],
-        onStdout: (s) => _terminal.write(s),
-        rows: rows,
-        cols: cols,
-      );
-    } catch (e) {
-      _terminal.write('❌ LỖI khởi chạy CLI: $e\r\n');
-      _showErrorSnackBar('Lỗi khởi chạy CLI: $e');
-      if (mounted) {
-        setState(() {
-          _running = false;
-          _mode = null;
-        });
-      }
+  Future<void> _copyLog() async {
+    if (_currentTabIndex == null) return;
+    final tab = _tabs[_currentTabIndex!];
+    final logs = tab.proot.getLogs();
+    if (logs.isNotEmpty) {
+      await Clipboard.setData(ClipboardData(text: logs));
+      tab.terminal.write('\r\n📋 Đã copy log vào clipboard!\r\n');
+      _showSnackBar('📋 Đã copy log vào clipboard!');
+    } else {
+      tab.terminal.write('\r\n⚠️ Không có log để copy.\r\n');
+      _showSnackBar('⚠️ Không có log để copy.');
     }
   }
 
-  Future<void> _launchGui() async {
-    if (_running || _stopping) return;
-    setState(() {
-      _mode = RunMode.gui;
-      _running = true;
-    });
+  void _clearLog() {
+    if (_currentTabIndex == null) return;
+    final tab = _tabs[_currentTabIndex!];
+    tab.proot.clearLogs();
+    tab.terminal.write('\r\n🗑️ Đã xóa log.\r\n');
+    _showSnackBar('🗑️ Đã xóa log.');
+  }
 
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) FocusScope.of(context).requestFocus(_terminalFocusNode);
-    });
+  // ==================== Xử lý modifier & sanitize ====================
 
-    await Future.delayed(const Duration(milliseconds: 50));
-
-    final rows = _terminal.viewHeight > 0 ? _terminal.viewHeight : 24;
-    final cols = _terminal.viewWidth > 0 ? _terminal.viewWidth : 80;
-
-    try {
-      final processFuture = _proot.start(
-        command: ['/bin/sh', '/usr/local/bin/start-gui.sh'],
-        onStdout: (s) => _terminal.write(s),
-        rows: rows,
-        cols: cols,
-      );
-      await Future.delayed(const Duration(seconds: 2));
-      await _openRealVnc();
-      await processFuture;
-    } catch (e) {
-      _terminal.write('❌ LỖI khởi chạy GUI: $e\r\n');
-      _showErrorSnackBar('Lỗi khởi chạy GUI: $e');
-      if (mounted) {
-        setState(() {
-          _running = false;
-          _mode = null;
-        });
+  String _applyCtrl(String input) {
+    if (input.length == 1) {
+      final code = input.codeUnitAt(0);
+      if (code >= 65 && code <= 90) {
+        return String.fromCharCode(code - 64);
+      } else if (code >= 97 && code <= 122) {
+        return String.fromCharCode(code - 96);
       }
     }
+    return input;
   }
 
-  Future<void> _openRealVnc() async {
-    final uri = Uri.parse('vnc://127.0.0.1:5900');
-    if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
-      _terminal.write(
-          '\r\n📱 Không mở được RealVNC Viewer. Hãy cài app "RealVNC Viewer" '
-          'từ Play Store rồi kết nối thủ công tới 127.0.0.1:5900\r\n');
-      _showSnackBar('Không mở được RealVNC Viewer. Vui lòng kết nối thủ công.');
+  String _applyAlt(String input) {
+    if (input.isNotEmpty) {
+      return '\x1b$input';
     }
+    return input;
   }
 
-  void _stopProcess() {
-    if (!_running || _stopping) return;
-    setState(() {
-      _stopping = true;
-    });
-    _proot.stop();
-    _terminal.write('\r\n🛑 Đã yêu cầu dừng tiến trình.\r\n');
-    Future.delayed(const Duration(seconds: 3), () {
-      if (mounted && _stopping) {
-        setState(() {
-          _stopping = false;
-          _running = false;
-          _mode = null;
-        });
-      }
-    });
+  String _sanitizeTerminalOutput(String data) {
+    String processed = data;
+    processed = processed.replaceAll('\x1b[2J\x1b[H', '\x1b[2J\x1b[H\x1b[3J');
+    processed = processed.replaceAll('\x1b[H\x1b[2J', '\x1b[H\x1b[2J\x1b[3J');
+    processed = processed.replaceAll('\x1b[2J', '\x1b[2J\x1b[3J');
+    processed = processed.replaceAll('\x0c', '\x1b[3J\x0c');
+    return processed;
   }
+
+  // ==================== Xử lý copy/paste ====================
+
+  Future<void> _handleSecondaryTapDown(
+      TerminalTab tab, TapDownDetails details, CellOffset offset) async {
+    final selection = tab.controller.selection;
+    final hasSelection = selection != null;
+
+    final clipboardData = await Clipboard.getData('text/plain');
+    final hasClipboard = clipboardData?.text?.isNotEmpty ?? false;
+
+    if (!mounted) return;
+
+    showModalBottomSheet(
+      context: context,
+      builder: (context) {
+        return SafeArea(
+          child: Wrap(
+            children: [
+              ListTile(
+                leading: const Icon(Icons.copy),
+                title: const Text('Copy'),
+                enabled: hasSelection,
+                onTap: () {
+                  if (hasSelection) {
+                    final text = tab.terminal.buffer.getText(selection!);
+                    Clipboard.setData(ClipboardData(text: text));
+                    tab.controller.clearSelection();
+                    _showSnackBar('📋 Đã copy');
+                  }
+                  Navigator.pop(context);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.paste),
+                title: const Text('Paste'),
+                enabled: hasClipboard,
+                onTap: () {
+                  if (hasClipboard) {
+                    tab.terminal.paste(clipboardData!.text!);
+                    _showSnackBar('📥 Đã paste');
+                  }
+                  Navigator.pop(context);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.clear),
+                title: const Text('Clear Selection'),
+                enabled: hasSelection,
+                onTap: () {
+                  tab.controller.clearSelection();
+                  Navigator.pop(context);
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  // ==================== Build giao diện ====================
 
   @override
   Widget build(BuildContext context) {
@@ -246,16 +425,16 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: Text(_appBarTitle),
         actions: [
-          if (_running || _stopping)
+          if (_currentTabIndex != null && _tabs.isNotEmpty)
             IconButton(
-              icon: _stopping
-                  ? const SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.stop),
-              onPressed: _stopping ? null : _stopProcess,
+              icon: const Icon(Icons.add_box_outlined),
+              onPressed: _newSession,
+              tooltip: 'Phiên mới',
+            ),
+          if (_currentTabIndex != null && _tabs.isNotEmpty)
+            IconButton(
+              icon: const Icon(Icons.stop),
+              onPressed: _stopCurrentTab,
               tooltip: 'Dừng tiến trình',
             ),
           IconButton(
@@ -268,24 +447,94 @@ class _HomeScreenState extends State<HomeScreen> {
             onPressed: _clearLog,
             tooltip: 'Clear log',
           ),
+          if (_currentTabIndex != null && _tabs.length > 1)
+            IconButton(
+              icon: const Icon(Icons.close),
+              onPressed: _closeCurrentTab,
+              tooltip: 'Đóng tab',
+            ),
         ],
       ),
       body: Column(
         children: [
           if (!_installed) _buildInstallPanel(),
-          if (_installed && _mode == null && !_running) _buildModePicker(),
+          if (_installed && (_tabs.isEmpty || _currentTabIndex == null))
+            _buildModePicker(),
+          if (_tabs.isNotEmpty) _buildTabBar(),
           Expanded(
-            child: TerminalView(
-              _terminal,
-              controller: _terminalController,
-              focusNode: _terminalFocusNode,
-              autofocus: true,
-              onSecondaryTapDown: _handleSecondaryTapDown,
-            ),
+            child: _tabs.isEmpty
+                ? _buildEmptyState()
+                : IndexedStack(
+                    index: _currentTabIndex ?? 0,
+                    children: _tabs
+                        .map(
+                          (tab) => _buildTerminalView(tab),
+                        )
+                        .toList(),
+                  ),
           ),
-          if (_running) _buildExtraKeysBar(),
+          if (_tabs.isNotEmpty) _buildExtraKeysBar(),
         ],
       ),
+    );
+  }
+
+  Widget _buildTabBar() {
+    return Container(
+      color: Colors.grey.shade900,
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          children: List.generate(_tabs.length, (index) {
+            final tab = _tabs[index];
+            final isSelected = index == _currentTabIndex;
+            return GestureDetector(
+              onTap: () {
+                setState(() => _currentTabIndex = index);
+                FocusScope.of(context).requestFocus(tab.focusNode);
+              },
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                color: isSelected ? Colors.teal : Colors.grey.shade800,
+                child: Row(
+                  children: [
+                    Text(
+                      'Term ${index + 1}',
+                      style: const TextStyle(color: Colors.white, fontSize: 12),
+                    ),
+                    if (isSelected)
+                      const SizedBox(width: 4),
+                    if (isSelected)
+                      GestureDetector(
+                        onTap: () => _closeCurrentTab(),
+                        child: const Icon(Icons.close,
+                            size: 14, color: Colors.white),
+                      ),
+                  ],
+                ),
+              ),
+            );
+          }),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTerminalView(TerminalTab tab) {
+    return TerminalView(
+      tab.terminal,
+      controller: tab.controller,
+      focusNode: tab.focusNode,
+      autofocus: true,
+      onSecondaryTapDown: (details, offset) =>
+          _handleSecondaryTapDown(tab, details, offset),
+    );
+  }
+
+  Widget _buildEmptyState() {
+    return const Center(
+      child: Text('Chưa có phiên nào. Hãy tạo phiên mới.'),
     );
   }
 
@@ -323,7 +572,7 @@ class _HomeScreenState extends State<HomeScreen> {
               leading: const Icon(Icons.terminal),
               title: const Text('CLI'),
               subtitle: const Text('Mở shell Alpine trong terminal'),
-              onTap: _launchCli,
+              onTap: _newSession, // Mặc định tạo phiên CLI mới
             ),
           ),
           const SizedBox(height: 8),
@@ -331,8 +580,12 @@ class _HomeScreenState extends State<HomeScreen> {
             child: ListTile(
               leading: const Icon(Icons.desktop_windows),
               title: const Text('GUI (VNC)'),
-              subtitle: const Text('Khởi động môi trường đồ họa và kết nối qua RealVNC'),
-              onTap: _launchGui,
+              subtitle:
+                  const Text('Khởi động môi trường đồ họa và kết nối qua RealVNC'),
+              onTap: () async {
+                final tab = await _createNewTab();
+                await _launchGuiForTab(tab);
+              },
             ),
           ),
         ],
@@ -340,45 +593,135 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ==================== EXTRA KEYS BAR (gọn gàng) ====================
+  // ==================== Extra keys bar ====================
 
   Widget _buildExtraKeysBar() {
-    if (!_running) return const SizedBox.shrink();
+    if (_tabs.isEmpty || _currentTabIndex == null) return const SizedBox.shrink();
+    final tab = _tabs[_currentTabIndex!];
+    if (!tab.running) return const SizedBox.shrink();
 
     return Container(
       color: Colors.grey.shade900,
       padding: const EdgeInsets.symmetric(vertical: 4),
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        child: Row(
-          children: [
-            _modifierKey('CTRL', _ctrlActive),
-            _modifierKey('ALT', _altActive),
-            _functionKey('ESC', '\x1b'),
-            _functionKey('TAB', '\t'),
-            _functionKey('ENTER', '\r'),
-            _functionKey('SPACE', ' '),
-            _functionKey('BACKSPACE', '\x7f'),
-            _functionKey('▲', '\x1b[A', ctrl: '\x1b[1;5A', alt: '\x1b[1;3A'),
-            _functionKey('▼', '\x1b[B', ctrl: '\x1b[1;5B', alt: '\x1b[1;3B'),
-            _functionKey('◀', '\x1b[D', ctrl: '\x1b[1;5D', alt: '\x1b[1;3D'),
-            _functionKey('▶', '\x1b[C', ctrl: '\x1b[1;5C', alt: '\x1b[1;3C'),
-            _functionKey('HOME', '\x1b[H'),
-            _functionKey('END', '\x1b[F'),
-            _functionKey('PGUP', '\x1b[5~'),
-            _functionKey('PGDN', '\x1b[6~'),
-            _functionKey('DEL', '\x7f'),
-          ],
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Hàng 1: menu, CTRL, ALT, ESC, TAB, ENTER, BACKSPACE, SPACE, DEL
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                _menuKey(tab),
+                _modifierKey(tab, 'CTRL', tab.ctrlActive),
+                _modifierKey(tab, 'ALT', tab.altActive),
+                _functionKey(tab, 'ESC', '\x1b'),
+                _functionKey(tab, 'TAB', '\t'),
+                _functionKey(tab, 'ENTER', '\r'),
+                _functionKey(tab, 'SPACE', ' '),
+                _functionKey(tab, 'BACKSPACE', '\x7f'),
+                _functionKey(tab, 'DEL', '\x7f'),
+              ],
+            ),
+          ),
+          const SizedBox(height: 4),
+          // Hàng 2: phím điều hướng
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                _functionKey(tab, '▲', '\x1b[A', ctrl: '\x1b[1;5A', alt: '\x1b[1;3A'),
+                _functionKey(tab, '▼', '\x1b[B', ctrl: '\x1b[1;5B', alt: '\x1b[1;3B'),
+                _functionKey(tab, '◀', '\x1b[D', ctrl: '\x1b[1;5D', alt: '\x1b[1;3D'),
+                _functionKey(tab, '▶', '\x1b[C', ctrl: '\x1b[1;5C', alt: '\x1b[1;3C'),
+                _functionKey(tab, 'HOME', '\x1b[H'),
+                _functionKey(tab, 'END', '\x1b[F'),
+                _functionKey(tab, 'PGUP', '\x1b[5~'),
+                _functionKey(tab, 'PGDN', '\x1b[6~'),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _menuKey(TerminalTab tab) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      child: InkWell(
+        onTap: () => _showTerminalMenu(tab),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          decoration: BoxDecoration(
+            color: Colors.grey.shade800,
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: const Icon(Icons.menu, color: Colors.white, size: 18),
         ),
       ),
     );
   }
 
-  Widget _modifierKey(String label, bool active) {
+  void _showTerminalMenu(TerminalTab tab) {
+    showModalBottomSheet(
+      context: context,
+      builder: (context) {
+        return SafeArea(
+          child: Wrap(
+            children: [
+              ListTile(
+                leading: const Icon(Icons.add_box),
+                title: const Text('New Session'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _newSession();
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.copy),
+                title: const Text('Copy Log'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _copyLog();
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.clear),
+                title: const Text('Clear Log'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _clearLog();
+                },
+              ),
+              if (tab.running)
+                ListTile(
+                  leading: const Icon(Icons.stop),
+                  title: const Text('Stop Process'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _stopCurrentTab();
+                  },
+                ),
+              ListTile(
+                leading: const Icon(Icons.close),
+                title: const Text('Close Tab'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _closeCurrentTab();
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _modifierKey(TerminalTab tab, String label, bool active) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 4),
       child: InkWell(
-        onTap: () => _toggleModifier(label),
+        onTap: () => _toggleModifier(tab, label),
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
           decoration: BoxDecoration(
@@ -401,11 +744,12 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _functionKey(String label, String normal, {String? ctrl, String? alt}) {
+  Widget _functionKey(TerminalTab tab, String label, String normal,
+      {String? ctrl, String? alt}) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 4),
       child: InkWell(
-        onTap: () => _sendKey(label, normal: normal, ctrl: ctrl, alt: alt),
+        onTap: () => _sendKey(tab, label, normal: normal, ctrl: ctrl, alt: alt),
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
           decoration: BoxDecoration(
@@ -424,112 +768,29 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  void _toggleModifier(String mod) {
+  void _toggleModifier(TerminalTab tab, String mod) {
     setState(() {
       if (mod == 'CTRL') {
-        _ctrlActive = !_ctrlActive;
+        tab.ctrlActive = !tab.ctrlActive;
       } else if (mod == 'ALT') {
-        _altActive = !_altActive;
+        tab.altActive = !tab.altActive;
       }
     });
   }
 
-  void _sendKey(String label, {String? normal, String? ctrl, String? alt}) {
+  void _sendKey(TerminalTab tab, String label,
+      {String? normal, String? ctrl, String? alt}) {
     String value = '';
-    if (_ctrlActive && ctrl != null) {
+    if (tab.ctrlActive && ctrl != null) {
       value = ctrl;
-    } else if (_altActive && alt != null) {
+    } else if (tab.altActive && alt != null) {
       value = alt;
     } else if (normal != null) {
       value = normal;
     }
 
     if (value.isNotEmpty) {
-      _proot.sendInput(value);
+      tab.proot.sendInput(value);
     }
-  }
-
-  // ==================== Xử lý modifier cho bàn phím vật lý ====================
-
-  /// Chuyển đổi chuỗi nhập từ bàn phím khi CTRL active.
-  /// Chỉ áp dụng cho các ký tự a-z hoặc A-Z. Các ký tự khác (escape, enter, v.v.) giữ nguyên.
-  String _applyCtrl(String input) {
-    if (input.length == 1) {
-      final code = input.codeUnitAt(0);
-      if (code >= 65 && code <= 90) {
-        return String.fromCharCode(code - 64); // A=65 -> 1
-      } else if (code >= 97 && code <= 122) {
-        return String.fromCharCode(code - 96); // a=97 -> 1
-      }
-    }
-    return input;
-  }
-
-  /// Chuyển đổi chuỗi nhập từ bàn phím khi ALT active.
-  /// Thêm tiền tố ESC vào trước ký tự (chuỗi) để tạo Alt+key.
-  String _applyAlt(String input) {
-    if (input.isNotEmpty) {
-      return '\x1b$input';
-    }
-    return input;
-  }
-
-  // ==================== Xử lý selection/copy/paste ====================
-
-  Future<void> _handleSecondaryTapDown(TapDownDetails details, CellOffset offset) async {
-    final selection = _terminalController.selection;
-    final hasSelection = selection != null;
-
-    final clipboardData = await Clipboard.getData('text/plain');
-    final hasClipboard = clipboardData?.text?.isNotEmpty ?? false;
-
-    if (!mounted) return;
-
-    showModalBottomSheet(
-      context: context,
-      builder: (context) {
-        return SafeArea(
-          child: Wrap(
-            children: [
-              ListTile(
-                leading: const Icon(Icons.copy),
-                title: const Text('Copy'),
-                enabled: hasSelection,
-                onTap: () {
-                  if (hasSelection) {
-                    final text = _terminal.buffer.getText(selection!);
-                    Clipboard.setData(ClipboardData(text: text));
-                    _terminalController.clearSelection();
-                    _showSnackBar('📋 Đã copy');
-                  }
-                  Navigator.pop(context);
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.paste),
-                title: const Text('Paste'),
-                enabled: hasClipboard,
-                onTap: () {
-                  if (hasClipboard) {
-                    _terminal.paste(clipboardData!.text!);
-                    _showSnackBar('📥 Đã paste');
-                  }
-                  Navigator.pop(context);
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.clear),
-                title: const Text('Clear Selection'),
-                enabled: hasSelection,
-                onTap: () {
-                  _terminalController.clearSelection();
-                  Navigator.pop(context);
-                },
-              ),
-            ],
-          ),
-        );
-      },
-    );
   }
 }
