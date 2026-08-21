@@ -274,8 +274,8 @@ class PRootService {
       'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
       'HOME': '/root',
       'TERM': 'xterm-256color',
-      'COLUMNS': '80',
-      'LINES': '24',
+      'COLUMNS': cols.toString(),  // ✅ Sử dụng cols thực tế
+      'LINES': rows.toString(),    // ✅ Sử dụng rows thực tế
       'PROOT_NO_SECCOMP': '1',
     };
 
@@ -291,28 +291,32 @@ class PRootService {
     _currentProcess = fake;
 
     _logSub = ProotJNI.onLog.listen((line) {
-      _log(line);
-      final bytes = utf8.encode('$line\n');
       if (line.startsWith('[pty]')) {
+        // Đây là output từ PTY, chỉ gửi đến onStdout, không ghi log chung
+        // để tránh nhân đôi output.
         String content = line.substring(5).trim();
         if (content.isNotEmpty) {
-          fake.addStdout(utf8.encode(content + '\n'));
-          onStdout?.call(content);
+          final data = utf8.encode(content + '\n');
+          fake.addStdout(data);
+          onStdout?.call(content + '\n');
         }
       } else {
+        // Log từ launcher (không phải PTY), ghi vào log buffer và gửi onLog/onStderr
+        _log(line);
+        final bytes = utf8.encode('$line\n');
         fake.addStderr(bytes);
         onStderr?.call(line);
       }
     });
 
-    late final int exitCode;
+    int exitCode = -1; // ✅ Khởi tạo an toàn thay vì late
     try {
       exitCode = await ProotJNI.runProot(
         prootBin,
         args,
         env,
-        rows: rows,  // ✅ Truyền rows
-        cols: cols,  // ✅ Truyền cols
+        rows: rows,
+        cols: cols,
       );
     } finally {
       await _logSub?.cancel();
