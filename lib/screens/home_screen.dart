@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/gestures.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:xterm/xterm.dart';
 import '../services/proot_service.dart';
@@ -276,7 +277,7 @@ class _HomeScreenState extends State<HomeScreen> {
               onSecondaryTapDown: _handleSecondaryTapDown,
             ),
           ),
-          if (_running) _buildExtraKeysBar(), // Chỉ hiện taskbar khi đang chạy terminal
+          if (_running) _buildExtraKeysBar(),
         ],
       ),
     );
@@ -558,7 +559,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // ==================== Xử lý selection/copy/paste ====================
 
-  Future<void> _handleSecondaryTapDown(TerminalViewTapDownDetails details) async {
+  Future<void> _handleSecondaryTapDown(TapDownDetails details, CellOffset offset) async {
     final selection = _terminalController.selection;
     final hasSelection = selection != null;
 
@@ -596,14 +597,6 @@ class _HomeScreenState extends State<HomeScreen> {
                     _terminal.paste(clipboardData!.text!);
                     _showSnackBar('📥 Đã paste');
                   }
-                  Navigator.pop(context);
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.select_all),
-                title: const Text('Select All'),
-                onTap: () {
-                  _terminalController.selectAll();
                   Navigator.pop(context);
                 },
               ),
