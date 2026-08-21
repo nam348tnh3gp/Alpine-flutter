@@ -17,7 +17,9 @@ class ProotLauncher {
             prootPath: String,
             args: Array<String>,
             env: Array<String>,
-            logCallback: ProotLogCallback?
+            logCallback: ProotLogCallback?,
+            rows: Int,
+            cols: Int
         ): Int
 
         @JvmStatic
@@ -34,10 +36,12 @@ class ProotLauncher {
             prootBin: String,
             args: List<String>,
             envVars: Map<String, String>,
+            rows: Int = 24,
+            cols: Int = 80,
             onLog: ProotLogCallback? = null
         ): Int {
             val envArray = envVars.map { "${it.key}=${it.value}" }.toTypedArray()
-            return runProot(prootBin, args.toTypedArray(), envArray, onLog)
+            return runProot(prootBin, args.toTypedArray(), envArray, onLog, rows, cols)
         }
     }
 }
