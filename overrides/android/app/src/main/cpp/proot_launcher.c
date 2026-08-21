@@ -160,21 +160,7 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         return -1;
     }
 
-    // Cấu hình termios theo Termux
-    struct termios tios;
-    tcgetattr(master_fd, &tios);
-    tios.c_iflag |= IUTF8;
-    tios.c_iflag &= ~(IXON | IXOFF);
-    tios.c_lflag |= (ECHO | ICANON | ISIG | IEXTEN);
-    tios.c_oflag |= (OPOST | ONLCR);
-    tios.c_iflag |= (ICRNL | IXON);
-    tios.c_cc[VERASE] = 127;
-    tios.c_cc[VINTR] = 3;
-    tios.c_cc[VQUIT] = 28;
-    tios.c_cc[VSUSP] = 26;
-    tcsetattr(master_fd, TCSANOW, &tios);
-
-    // Đặt kích thước
+    // Đặt kích thước PTY (thực hiện trên master_fd trước khi fork)
     if (rows <= 0) rows = 24;
     if (cols <= 0) cols = 80;
     struct winsize sz = {
@@ -194,18 +180,36 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         int slave_fd = open(devname, O_RDWR);
         if (slave_fd < 0) _exit(127);
 
+        // Cấu hình termios trên slave_fd (quan trọng: phải thực hiện trên slave,
+        // không phải master, để echo và canonical hoạt động đúng)
+        struct termios tios;
+        if (tcgetattr(slave_fd, &tios) == 0) {
+            tios.c_iflag |= IUTF8;
+            tios.c_iflag &= ~(IXON | IXOFF);
+            tios.c_lflag |= (ECHO | ICANON | ISIG | IEXTEN);
+            tios.c_oflag |= (OPOST | ONLCR);
+            tios.c_iflag |= (ICRNL | IXON);
+            tios.c_cc[VERASE] = 127;   // Backspace
+            tios.c_cc[VINTR] = 3;      // Ctrl-C
+            tios.c_cc[VQUIT] = 28;     // Ctrl-\
+            tios.c_cc[VSUSP] = 26;     // Ctrl-Z
+            tcsetattr(slave_fd, TCSANOW, &tios);
+        }
+
         dup2(slave_fd, 0);
         dup2(slave_fd, 1);
         dup2(slave_fd, 2);
 
-        // Đóng tất cả file descriptor > 2
+        // Đóng tất cả file descriptor > 2 (trừ slave_fd đã dup)
         DIR *self_dir = opendir("/proc/self/fd");
         if (self_dir != NULL) {
             int self_dir_fd = dirfd(self_dir);
             struct dirent *entry;
             while ((entry = readdir(self_dir)) != NULL) {
                 int fd = atoi(entry->d_name);
-                if (fd > 2 && fd != self_dir_fd) close(fd);
+                if (fd > 2 && fd != self_dir_fd && fd != slave_fd) {
+                    close(fd);
+                }
             }
             closedir(self_dir);
         }
@@ -258,8 +262,10 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         }
     }
 
+    // Đọc nốt dữ liệu còn lại trước khi đóng
     drain_fd(master_fd, &ctx, "[pty]", linebuf, &linelen, sizeof(linebuf));
     if (linelen > 0) emit_log(&ctx, "[pty]", linebuf, linelen);
+
     close(master_fd);
     g_master_fd = -1;
     g_child_pid = -1;
@@ -311,6 +317,7 @@ Java_com_example_alpinerunner_ProotLauncher_writeToPty(
 
 JNIEXPORT void JNICALL
 Java_com_example_alpinerunner_ProotLauncher_killProot(JNIEnv *env, jobject thiz) {
+    // Chỉ gửi tín hiệu, không đóng g_master_fd ở đây vì parent vẫn đang dùng nó
     if (g_child_pid > 0) {
         kill(g_child_pid, SIGTERM);
         usleep(100000);
@@ -319,10 +326,7 @@ Java_com_example_alpinerunner_ProotLauncher_killProot(JNIEnv *env, jobject thiz)
         }
         g_child_pid = -1;
     }
-    if (g_master_fd != -1) {
-        close(g_master_fd);
-        g_master_fd = -1;
-    }
+    // g_master_fd sẽ được đóng bởi parent khi vòng lặp kết thúc
 }
 
 JNIEXPORT void JNICALL
