@@ -22,11 +22,14 @@ class TerminalTab {
   bool ctrlActive = false;
   bool altActive = false;
 
-  TerminalTab()
+  TerminalTab({VoidCallback? onProcessExited})
       : terminal = Terminal(maxLines: 5000),
         controller = TerminalController(),
         focusNode = FocusNode(),
-        proot = PRootService(onLog: (l) => terminal.write('$l\r\n'));
+        proot = PRootService(
+          onLog: (l) => terminal.write('$l\r\n'),
+          onProcessExited: onProcessExited,
+        );
 
   void dispose() {
     proot.stop();
@@ -81,7 +84,6 @@ class _HomeScreenState extends State<HomeScreen> {
   // ==================== Kiểm tra & cài đặt rootfs ====================
 
   Future<void> _checkInstalled() async {
-    // Dùng một instance tạm để kiểm tra (vì rootfs dùng chung)
     final tempService = PRootService(onLog: (_) {});
     final ok = await tempService.isInstalled();
     if (mounted) setState(() => _installed = ok);
@@ -92,11 +94,9 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() => _installing = true);
     final tempService = PRootService(
       onLog: (l) {
-        // Hiển thị log cài đặt vào terminal đầu tiên nếu có, hoặc tạo tab tạm
         if (_tabs.isNotEmpty) {
           _tabs.first.terminal.write('$l\r\n');
         } else {
-          // Tạo một tab tạm để hiển thị log cài đặt
           final tab = TerminalTab();
           setState(() {
             _tabs.add(tab);
@@ -124,13 +124,22 @@ class _HomeScreenState extends State<HomeScreen> {
   // ==================== Quản lý tab & phiên ====================
 
   Future<TerminalTab> _createNewTab() async {
-    final tab = TerminalTab();
+    final tab = TerminalTab(
+      onProcessExited: () {
+        if (mounted) {
+          setState(() {
+            tab.running = false;
+            tab.mode = null;
+            tab.stopping = false;
+          });
+        }
+      },
+    );
     setState(() {
       _tabs.add(tab);
       _currentTabIndex = _tabs.length - 1;
     });
 
-    // Kết nối terminal I/O cho tab
     tab.terminal.onOutput = (data) {
       if (tab.ctrlActive) {
         tab.proot.sendInput(_applyCtrl(data));
@@ -143,17 +152,6 @@ class _HomeScreenState extends State<HomeScreen> {
 
     tab.terminal.onResize = (width, height, pixelWidth, pixelHeight) {
       tab.proot.resizeTerminal(width, height);
-    };
-
-    // Xử lý khi process thoát
-    tab.proot.onProcessExited = () {
-      if (mounted) {
-        setState(() {
-          tab.running = false;
-          tab.mode = null;
-          tab.stopping = false;
-        });
-      }
     };
 
     return tab;
@@ -243,7 +241,6 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  /// Tạo phiên mới (tab mới và chạy CLI)
   Future<void> _newSession() async {
     final tab = await _createNewTab();
     await _launchCliForTab(tab);
