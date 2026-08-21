@@ -29,11 +29,11 @@ static pid_t g_child_pid = -1;
 
 static void emit_log(LogCtx *ctx, const char *prefix, const char *line, size_t len) {
     if (ctx->callback == NULL || ctx->onLogMid == NULL) {
-        LOGD("%s %.*s", prefix, (int)len, line);
+        LOGD("%s%.*s", prefix, (int)len, line);   // FIX: bỏ khoảng trắng thừa
         return;
     }
     char buf[4200];
-    int n = snprintf(buf, sizeof(buf), "%s %.*s", prefix, (int)len, line);
+    int n = snprintf(buf, sizeof(buf), "%s%.*s", prefix, (int)len, line);  // FIX: bỏ khoảng trắng thừa
     if (n < 0) return;
     jstring jline = (*ctx->env)->NewStringUTF(ctx->env, buf);
     if (jline == NULL) return;
@@ -163,7 +163,7 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         int slave_fd = open(devname, O_RDWR);
         if (slave_fd < 0) _exit(127);
 
-        // Cấu hình termios trên slave_fd (như đã sửa trước đó)
+        // Cấu hình termios trên slave_fd (quan trọng)
         struct termios tios;
         if (tcgetattr(slave_fd, &tios) == 0) {
             tios.c_iflag |= IUTF8;
