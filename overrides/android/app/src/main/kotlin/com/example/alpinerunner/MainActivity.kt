@@ -15,9 +15,9 @@ class MainActivity : FlutterActivity() {
     private val PROOT_LOG_CHANNEL = "alpine_runner/proot_logs"
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    // Dùng 2 executor riêng để writeToPty không bị block bởi runProot
-    private val prootExecutor = Executors.newSingleThreadExecutor()
-    private val ptyExecutor = Executors.newSingleThreadExecutor()
+    // Dùng cached thread pool để hỗ trợ nhiều phiên chạy song song
+    private val prootExecutor = Executors.newCachedThreadPool()
+    private val ptyExecutor = Executors.newCachedThreadPool()
 
     private var logSink: EventChannel.EventSink? = null
 
@@ -53,6 +53,7 @@ class MainActivity : FlutterActivity() {
                         val env = call.argument<Map<String, String>>("env")
                         val rows = call.argument<Int>("rows") ?: 24
                         val cols = call.argument<Int>("cols") ?: 80
+                        val sessionId = call.argument<String>("sessionId") ?: "default"
                         if (prootPath == null || args == null || env == null) {
                             result.error("BAD_ARGS", "Thiếu prootPath/args/env", null)
                             return@setMethodCallHandler
@@ -65,7 +66,8 @@ class MainActivity : FlutterActivity() {
                                     args,
                                     env,
                                     rows = rows,
-                                    cols = cols
+                                    cols = cols,
+                                    sessionId = sessionId
                                 ) { line ->
                                     mainHandler.post { logSink?.success(line) }
                                 }
@@ -79,26 +81,29 @@ class MainActivity : FlutterActivity() {
                     }
                     "writeToPty" -> {
                         val data = call.argument<ByteArray>("data")
+                        val sessionId = call.argument<String>("sessionId") ?: "default"
                         if (data == null) {
                             result.error("BAD_ARGS", "Missing data", null)
                             return@setMethodCallHandler
                         }
                         ptyExecutor.execute {
-                            val written = ProotLauncher.writeToPty(data)
+                            val written = ProotLauncher.writeToPty(data, sessionId)
                             mainHandler.post { result.success(written) }
                         }
                     }
                     "killProot" -> {
+                        val sessionId = call.argument<String>("sessionId") ?: "default"
                         ptyExecutor.execute {
-                            ProotLauncher.killProot()
+                            ProotLauncher.killProot(sessionId)
                             mainHandler.post { result.success(null) }
                         }
                     }
                     "resizePty" -> {
                         val width = call.argument<Int>("width") ?: 80
                         val height = call.argument<Int>("height") ?: 24
+                        val sessionId = call.argument<String>("sessionId") ?: "default"
                         ptyExecutor.execute {
-                            ProotLauncher.resizePty(width, height)
+                            ProotLauncher.resizePty(width, height, sessionId)
                             mainHandler.post { result.success(null) }
                         }
                     }
