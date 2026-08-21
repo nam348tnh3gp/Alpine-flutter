@@ -18,22 +18,67 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
+#define MAX_SESSIONS 16
+
+typedef struct {
+    int master_fd;
+    pid_t child_pid;
+    char session_id[64];
+} Session;
+
 typedef struct {
     JNIEnv *env;
     jobject callback;
     jmethodID onLogMid;
+    const char *session_id;
 } LogCtx;
 
-static int g_master_fd = -1;
-static pid_t g_child_pid = -1;
+static Session g_sessions[MAX_SESSIONS];
+static int g_session_count = 0;
+
+static int find_session(const char *session_id, Session **out) {
+    for (int i = 0; i < g_session_count; i++) {
+        if (strcmp(g_sessions[i].session_id, session_id) == 0) {
+            *out = &g_sessions[i];
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int add_session(const char *session_id, int master_fd, pid_t child_pid) {
+    if (g_session_count >= MAX_SESSIONS) return -1;
+    Session *s = &g_sessions[g_session_count++];
+    s->master_fd = master_fd;
+    s->child_pid = child_pid;
+    strncpy(s->session_id, session_id, sizeof(s->session_id) - 1);
+    s->session_id[sizeof(s->session_id) - 1] = '\0';
+    return 0;
+}
+
+static int remove_session(const char *session_id) {
+    for (int i = 0; i < g_session_count; i++) {
+        if (strcmp(g_sessions[i].session_id, session_id) == 0) {
+            // Shift remaining
+            for (int j = i; j < g_session_count - 1; j++) {
+                g_sessions[j] = g_sessions[j + 1];
+            }
+            g_session_count--;
+            return 0;
+        }
+    }
+    return -1;
+}
 
 static void emit_log(LogCtx *ctx, const char *prefix, const char *line, size_t len) {
     if (ctx->callback == NULL || ctx->onLogMid == NULL) {
-        LOGD("%s%.*s", prefix, (int)len, line);   // FIX: bỏ khoảng trắng thừa
+        LOGD("%s%s%.*s", ctx->session_id ? ctx->session_id : "", prefix, (int)len, line);
         return;
     }
     char buf[4200];
-    int n = snprintf(buf, sizeof(buf), "%s%.*s", prefix, (int)len, line);  // FIX: bỏ khoảng trắng thừa
+    int n = snprintf(buf, sizeof(buf), "[%s]%s%.*s",
+                     ctx->session_id ? ctx->session_id : "",
+                     prefix, (int)len, line);
     if (n < 0) return;
     jstring jline = (*ctx->env)->NewStringUTF(ctx->env, buf);
     if (jline == NULL) return;
@@ -53,7 +98,8 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
     jobjectArray envArray,
     jobject logCallback,
     jint rows,
-    jint cols) {
+    jint cols,
+    jstring sessionId) {
 
     LogCtx ctx = {0};
     ctx.env = env;
@@ -67,10 +113,19 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         }
     }
 
+    const char *session_id = (*env)->GetStringUTFChars(env, sessionId, NULL);
+    if (session_id == NULL) {
+        const char *m = "GetStringUTFChars(sessionId) thất bại";
+        emit_log(&ctx, "[launcher]", m, strlen(m));
+        return -1;
+    }
+    ctx.session_id = session_id;
+
     const char *proot = (*env)->GetStringUTFChars(env, prootPath, NULL);
     if (proot == NULL) {
         const char *m = "GetStringUTFChars(prootPath) thất bại";
         emit_log(&ctx, "[launcher]", m, strlen(m));
+        (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
         return -1;
     }
 
@@ -80,12 +135,14 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         int n = snprintf(msg, sizeof(msg), "[launcher] Không tìm thấy proot binary tại '%s': %s", proot, strerror(errno));
         emit_log(&ctx, "[launcher]", msg, (size_t)n);
         (*env)->ReleaseStringUTFChars(env, prootPath, proot);
+        (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
         return -1;
     } else if (!(st.st_mode & S_IXUSR)) {
         char msg[512];
         int n = snprintf(msg, sizeof(msg), "[launcher] '%s' thiếu quyền execute", proot);
         emit_log(&ctx, "[launcher]", msg, (size_t)n);
         (*env)->ReleaseStringUTFChars(env, prootPath, proot);
+        (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
         return -1;
     }
 
@@ -130,6 +187,8 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         char msg[256];
         int n = snprintf(msg, sizeof(msg), "[launcher] open(/dev/ptmx) thất bại: %s", strerror(errno));
         emit_log(&ctx, "[launcher]", msg, (size_t)n);
+        (*env)->ReleaseStringUTFChars(env, prootPath, proot);
+        (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
         return -1;
     }
 
@@ -140,6 +199,8 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         int n = snprintf(msg, sizeof(msg), "[launcher] grantpt/unlockpt/ptsname_r thất bại");
         emit_log(&ctx, "[launcher]", msg, (size_t)n);
         close(master_fd);
+        (*env)->ReleaseStringUTFChars(env, prootPath, proot);
+        (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
         return -1;
     }
 
@@ -163,7 +224,7 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         int slave_fd = open(devname, O_RDWR);
         if (slave_fd < 0) _exit(127);
 
-        // Cấu hình termios trên slave_fd (quan trọng)
+        // Cấu hình termios trên slave_fd
         struct termios tios;
         if (tcgetattr(slave_fd, &tios) == 0) {
             tios.c_iflag |= IUTF8;
@@ -213,11 +274,22 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         int n = snprintf(msg, sizeof(msg), "[launcher] fork thất bại: %s", strerror(errno));
         emit_log(&ctx, "[launcher]", msg, (size_t)n);
         close(master_fd);
+        (*env)->ReleaseStringUTFChars(env, prootPath, proot);
+        (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
         return -1;
     }
 
-    g_master_fd = master_fd;
-    g_child_pid = pid;
+    // Lưu session
+    if (add_session(session_id, master_fd, pid) != 0) {
+        char msg[128];
+        int n = snprintf(msg, sizeof(msg), "[launcher] quá nhiều session");
+        emit_log(&ctx, "[launcher]", msg, (size_t)n);
+        kill(pid, SIGKILL);
+        close(master_fd);
+        (*env)->ReleaseStringUTFChars(env, prootPath, proot);
+        (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
+        return -1;
+    }
 
     // Đặt non-blocking cho master_fd
     fcntl(master_fd, F_SETFL, O_NONBLOCK);
@@ -230,14 +302,12 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         struct pollfd fds[1] = { { master_fd, POLLIN, 0 } };
         poll(fds, 1, 100);
 
-        // Đọc tất cả dữ liệu sẵn có và gửi raw bytes
         char chunk[4096];
         ssize_t n;
         while ((n = read(master_fd, chunk, sizeof(chunk))) > 0) {
             emit_log(&ctx, "[pty]", chunk, (size_t)n);
         }
         if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            // Lỗi đọc không mong muốn
             char msg[128];
             int len = snprintf(msg, sizeof(msg), "[launcher] read lỗi: %s", strerror(errno));
             emit_log(&ctx, "[launcher]", msg, (size_t)len);
@@ -262,8 +332,7 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
     }
 
     close(master_fd);
-    g_master_fd = -1;
-    g_child_pid = -1;
+    remove_session(session_id);
 
     if (WIFEXITED(status)) {
         exitCode = WEXITSTATUS(status);
@@ -284,6 +353,8 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
     for (int i = 0; i < envc; i++) free(envp[i]);
     free(envp);
 
+    (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
+
     return exitCode;
 }
 
@@ -291,35 +362,56 @@ JNIEXPORT jint JNICALL
 Java_com_example_alpinerunner_ProotLauncher_writeToPty(
     JNIEnv *env,
     jobject thiz,
-    jbyteArray data) {
-    if (g_master_fd == -1) {
-        LOGE("writeToPty: master_fd không hợp lệ");
+    jbyteArray data,
+    jstring sessionId) {
+    const char *session_id = (*env)->GetStringUTFChars(env, sessionId, NULL);
+    if (session_id == NULL) return -1;
+
+    Session *s;
+    if (find_session(session_id, &s) != 0) {
+        LOGE("writeToPty: không tìm thấy session %s", session_id);
+        (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
         return -1;
     }
+
     jsize len = (*env)->GetArrayLength(env, data);
     jbyte *bytes = (*env)->GetByteArrayElements(env, data, NULL);
     if (bytes == NULL) {
-        LOGE("writeToPty: không lấy được bytes");
+        (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
         return -1;
     }
-    ssize_t written = write(g_master_fd, bytes, len);
+    ssize_t written = write(s->master_fd, bytes, len);
     if (written < 0) {
         LOGE("writeToPty: write thất bại: %s", strerror(errno));
     }
     (*env)->ReleaseByteArrayElements(env, data, bytes, JNI_ABORT);
+    (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
     return (jint)written;
 }
 
 JNIEXPORT void JNICALL
-Java_com_example_alpinerunner_ProotLauncher_killProot(JNIEnv *env, jobject thiz) {
-    if (g_child_pid > 0) {
-        kill(g_child_pid, SIGTERM);
-        usleep(100000);
-        if (kill(g_child_pid, 0) == 0) {
-            kill(g_child_pid, SIGKILL);
+Java_com_example_alpinerunner_ProotLauncher_killProot(
+    JNIEnv *env,
+    jobject thiz,
+    jstring sessionId) {
+    const char *session_id = (*env)->GetStringUTFChars(env, sessionId, NULL);
+    if (session_id == NULL) return;
+
+    Session *s;
+    if (find_session(session_id, &s) == 0) {
+        if (s->child_pid > 0) {
+            kill(s->child_pid, SIGTERM);
+            usleep(100000);
+            if (kill(s->child_pid, 0) == 0) {
+                kill(s->child_pid, SIGKILL);
+            }
         }
-        g_child_pid = -1;
+        if (s->master_fd != -1) {
+            close(s->master_fd);
+        }
+        remove_session(session_id);
     }
+    (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
 }
 
 JNIEXPORT void JNICALL
@@ -327,8 +419,17 @@ Java_com_example_alpinerunner_ProotLauncher_resizePty(
     JNIEnv *env,
     jobject thiz,
     jint width,
-    jint height) {
-    if (g_master_fd == -1) return;
+    jint height,
+    jstring sessionId) {
+    const char *session_id = (*env)->GetStringUTFChars(env, sessionId, NULL);
+    if (session_id == NULL) return;
+
+    Session *s;
+    if (find_session(session_id, &s) != 0) {
+        (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
+        return;
+    }
+
     if (width <= 0) width = 80;
     if (height <= 0) height = 24;
     struct winsize sz = {
@@ -337,8 +438,9 @@ Java_com_example_alpinerunner_ProotLauncher_resizePty(
         .ws_xpixel = (unsigned short) (width * 8),
         .ws_ypixel = (unsigned short) (height * 16)
     };
-    ioctl(g_master_fd, TIOCSWINSZ, &sz);
-    if (g_child_pid > 0) {
-        kill(g_child_pid, SIGWINCH);
+    ioctl(s->master_fd, TIOCSWINSZ, &sz);
+    if (s->child_pid > 0) {
+        kill(s->child_pid, SIGWINCH);
     }
+    (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
 }
