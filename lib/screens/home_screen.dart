@@ -16,13 +16,19 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   late final PRootService _proot;
   final Terminal _terminal = Terminal(maxLines: 5000);
+  final TerminalController _terminalController = TerminalController();
   final FocusNode _terminalFocusNode = FocusNode();
+
   bool _installed = false;
   bool _installing = false;
   double _progress = 0;
   RunMode? _mode;
   bool _running = false;
   bool _stopping = false;
+
+  // Toggle modifier keys
+  bool _ctrlActive = false;
+  bool _altActive = false;
 
   String get _appBarTitle {
     if (!_installed) return 'Alpine Runner - Chưa cài';
@@ -64,6 +70,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     _proot.stop();
+    _terminalController.dispose();
     _terminalFocusNode.dispose();
     super.dispose();
   }
@@ -136,7 +143,6 @@ class _HomeScreenState extends State<HomeScreen> {
       if (mounted) FocusScope.of(context).requestFocus(_terminalFocusNode);
     });
 
-    // Chờ một chút để layout hoàn tất (an toàn nếu terminal chưa có kích thước)
     await Future.delayed(const Duration(milliseconds: 50));
 
     final rows = _terminal.viewHeight > 0 ? _terminal.viewHeight : 24;
@@ -146,7 +152,6 @@ class _HomeScreenState extends State<HomeScreen> {
       await _proot.start(
         command: ['/bin/sh', '-l'],
         onStdout: (s) => _terminal.write(s),
-        onStderr: (s) => _terminal.write(s),
         rows: rows,
         cols: cols,
       );
@@ -182,7 +187,6 @@ class _HomeScreenState extends State<HomeScreen> {
       final processFuture = _proot.start(
         command: ['/bin/sh', '/usr/local/bin/start-gui.sh'],
         onStdout: (s) => _terminal.write(s),
-        onStderr: (s) => _terminal.write(s),
         rows: rows,
         cols: cols,
       );
@@ -218,7 +222,6 @@ class _HomeScreenState extends State<HomeScreen> {
     });
     _proot.stop();
     _terminal.write('\r\n🛑 Đã yêu cầu dừng tiến trình.\r\n');
-    // Fallback nếu onProcessExited không được gọi kịp
     Future.delayed(const Duration(seconds: 3), () {
       if (mounted && _stopping) {
         setState(() {
@@ -267,10 +270,13 @@ class _HomeScreenState extends State<HomeScreen> {
           Expanded(
             child: TerminalView(
               _terminal,
+              controller: _terminalController,
               focusNode: _terminalFocusNode,
               autofocus: true,
+              onSecondaryTapDown: _handleSecondaryTapDown,
             ),
           ),
+          if (_running) _buildExtraKeysBar(), // Chỉ hiện taskbar khi đang chạy terminal
         ],
       ),
     );
@@ -324,6 +330,296 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ],
       ),
+    );
+  }
+
+  // ==================== EXTRA KEYS TASKBAR (giống Termux) ====================
+
+  Widget _buildExtraKeysBar() {
+    if (!_running) return const SizedBox.shrink();
+
+    return Container(
+      color: Colors.grey.shade900,
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Hàng phím chức năng
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                _modifierKey('CTRL', _ctrlActive),
+                _modifierKey('ALT', _altActive),
+                _functionKey('ESC', '\x1b'),
+                _functionKey('TAB', '\t'),
+                _functionKey('ENTER', '\r'),
+                _functionKey('SPACE', ' '),
+                _functionKey('BACKSPACE', '\x7f'),
+              ],
+            ),
+          ),
+          const SizedBox(height: 4),
+          // Hàng phím điều hướng
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                _functionKey('▲', '\x1b[A', ctrl: '\x1b[1;5A', alt: '\x1b[1;3A'),
+                _functionKey('▼', '\x1b[B', ctrl: '\x1b[1;5B', alt: '\x1b[1;3B'),
+                _functionKey('◀', '\x1b[D', ctrl: '\x1b[1;5D', alt: '\x1b[1;3D'),
+                _functionKey('▶', '\x1b[C', ctrl: '\x1b[1;5C', alt: '\x1b[1;3C'),
+                _functionKey('HOME', '\x1b[H'),
+                _functionKey('END', '\x1b[F'),
+                _functionKey('PGUP', '\x1b[5~'),
+                _functionKey('PGDN', '\x1b[6~'),
+                _functionKey('DEL', '\x7f'),
+              ],
+            ),
+          ),
+          const SizedBox(height: 4),
+          // Hàng chữ cái A-Z
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: List.generate(26, (index) {
+                final letter = String.fromCharCode(65 + index); // A-Z
+                return _charKey(letter);
+              }),
+            ),
+          ),
+          const SizedBox(height: 4),
+          // Hàng số 0-9 và dấu câu
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                ...List.generate(10, (index) => _charKey('$index')),
+                _charKey('-'),
+                _charKey('_'),
+                _charKey('='),
+                _charKey('+'),
+                _charKey('|'),
+                _charKey('\\'),
+                _charKey('/'),
+                _charKey('?'),
+                _charKey('~'),
+                _charKey('`'),
+                _charKey(':'),
+                _charKey(';'),
+                _charKey('"'),
+                _charKey('\''),
+                _charKey('{'),
+                _charKey('}'),
+                _charKey('['),
+                _charKey(']'),
+                _charKey('<'),
+                _charKey('>'),
+                _charKey('.'),
+                _charKey(','),
+                _charKey('!'),
+                _charKey('@'),
+                _charKey('#'),
+                _charKey('\$'),
+                _charKey('%'),
+                _charKey('^'),
+                _charKey('&'),
+                _charKey('*'),
+                _charKey('('),
+                _charKey(')'),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _modifierKey(String label, bool active) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      child: InkWell(
+        onTap: () => _toggleModifier(label),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          decoration: BoxDecoration(
+            color: active ? Colors.teal : Colors.grey.shade800,
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(
+              color: active ? Colors.tealAccent : Colors.transparent,
+            ),
+          ),
+          child: Text(
+            label,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 14,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _functionKey(String label, String normal, {String? ctrl, String? alt}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      child: InkWell(
+        onTap: () => _sendKey(label, normal: normal, ctrl: ctrl, alt: alt),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          decoration: BoxDecoration(
+            color: Colors.grey.shade800,
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Text(
+            label,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 14,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _charKey(String char) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: InkWell(
+        onTap: () => _sendChar(char),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+          decoration: BoxDecoration(
+            color: Colors.grey.shade800,
+            borderRadius: BorderRadius.circular(4),
+          ),
+          child: Text(
+            char,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 12,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _toggleModifier(String mod) {
+    setState(() {
+      if (mod == 'CTRL') {
+        _ctrlActive = !_ctrlActive;
+      } else if (mod == 'ALT') {
+        _altActive = !_altActive;
+      }
+    });
+  }
+
+  void _sendKey(String label, {String? normal, String? ctrl, String? alt}) {
+    String value = '';
+    if (_ctrlActive && ctrl != null) {
+      value = ctrl;
+    } else if (_altActive && alt != null) {
+      value = alt;
+    } else if (normal != null) {
+      value = normal;
+    }
+
+    if (value.isNotEmpty) {
+      _proot.sendInput(value);
+    }
+  }
+
+  void _sendChar(String char) {
+    if (_ctrlActive) {
+      final ctrlVal = _getCtrlChar(char);
+      if (ctrlVal.isNotEmpty) {
+        _proot.sendInput(ctrlVal);
+      }
+    } else if (_altActive) {
+      _proot.sendInput('\x1b$char'); // Alt+char
+    } else {
+      _proot.sendInput(char);
+    }
+  }
+
+  String _getCtrlChar(String char) {
+    if (char.length == 1 && char.codeUnitAt(0) >= 65 && char.codeUnitAt(0) <= 90) {
+      return String.fromCharCode(char.codeUnitAt(0) - 64); // A->1, B->2 ... Z->26
+    }
+    if (char.length == 1 && char.codeUnitAt(0) >= 97 && char.codeUnitAt(0) <= 122) {
+      return String.fromCharCode(char.codeUnitAt(0) - 96); // a->1, b->2 ... z->26
+    }
+    return '';
+  }
+
+  // ==================== Xử lý selection/copy/paste ====================
+
+  Future<void> _handleSecondaryTapDown(TerminalViewTapDownDetails details) async {
+    final selection = _terminalController.selection;
+    final hasSelection = selection != null;
+
+    final clipboardData = await Clipboard.getData('text/plain');
+    final hasClipboard = clipboardData?.text?.isNotEmpty ?? false;
+
+    if (!mounted) return;
+
+    showModalBottomSheet(
+      context: context,
+      builder: (context) {
+        return SafeArea(
+          child: Wrap(
+            children: [
+              ListTile(
+                leading: const Icon(Icons.copy),
+                title: const Text('Copy'),
+                enabled: hasSelection,
+                onTap: () {
+                  if (hasSelection) {
+                    final text = _terminal.buffer.getText(selection!);
+                    Clipboard.setData(ClipboardData(text: text));
+                    _terminalController.clearSelection();
+                    _showSnackBar('📋 Đã copy');
+                  }
+                  Navigator.pop(context);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.paste),
+                title: const Text('Paste'),
+                enabled: hasClipboard,
+                onTap: () {
+                  if (hasClipboard) {
+                    _terminal.paste(clipboardData!.text!);
+                    _showSnackBar('📥 Đã paste');
+                  }
+                  Navigator.pop(context);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.select_all),
+                title: const Text('Select All'),
+                onTap: () {
+                  _terminalController.selectAll();
+                  Navigator.pop(context);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.clear),
+                title: const Text('Clear Selection'),
+                enabled: hasSelection,
+                onTap: () {
+                  _terminalController.clearSelection();
+                  Navigator.pop(context);
+                },
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 }
