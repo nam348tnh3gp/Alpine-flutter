@@ -223,6 +223,8 @@ class PRootService {
     required List<String> command,
     void Function(String)? onStdout,
     void Function(String)? onStderr,
+    int rows = 24,  // ✅ Thêm tham số rows
+    int cols = 80,  // ✅ Thêm tham số cols
   }) async {
     if (_running) {
       throw Exception('PRootService đang chạy.');
@@ -309,6 +311,8 @@ class PRootService {
         prootBin,
         args,
         env,
+        rows: rows,  // ✅ Truyền rows
+        cols: cols,  // ✅ Truyền cols
       );
     } finally {
       await _logSub?.cancel();
