@@ -13,8 +13,9 @@ class FakeProcess implements Process {
   final Completer<int> _exitCodeCompleter = Completer<int>();
   final StreamController<List<int>> _stdoutController = StreamController.broadcast();
   final StreamController<List<int>> _stderrController = StreamController.broadcast();
+  final void Function()? onKill; // Callback để kill đúng session
 
-  FakeProcess(this._pid, this._exitCode);
+  FakeProcess(this._pid, this._exitCode, {this.onKill});
 
   @override
   int get pid => _pid;
@@ -40,7 +41,7 @@ class FakeProcess implements Process {
 
   @override
   bool kill([ProcessSignal signal = ProcessSignal.sigterm]) {
-    ProotJNI.killProot();
+    onKill?.call();
     return true;
   }
 
@@ -285,7 +286,9 @@ class PRootService {
     _log('🚀 Khởi chạy JNI: $prootBin ${args.join(' ')}');
     _log('   PROOT_LOADER=$loaderPath');
 
-    final fake = FakeProcess(0, -1);
+    final fake = FakeProcess(0, -1, onKill: () {
+      ProotJNI.killProot(sessionId: _sessionId);
+    });
     _currentProcess = fake;
 
     _logSub = ProotJNI.onLog.listen((line) {
@@ -346,14 +349,11 @@ class PRootService {
 
   void stop() {
     if (_currentProcess != null) {
-      _currentProcess?.kill();
+      _currentProcess?.kill(); // Gọi callback kill session
       _currentProcess = null;
     }
     _running = false;
     _logSub?.cancel();
     _logSub = null;
-    if (_sessionId.isNotEmpty) {
-      ProotJNI.killProot(sessionId: _sessionId);
-    }
   }
 }
