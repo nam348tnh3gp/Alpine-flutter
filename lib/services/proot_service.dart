@@ -290,6 +290,10 @@ class PRootService {
       if (line.startsWith('[pty]')) {
         // Bỏ prefix và truyền nguyên vẹn (không trim, không thêm \n)
         String content = line.substring(5);
+        // Loại bỏ khoảng trắng thừa do format "%s %.*s" trong native (sửa nhanh)
+        if (content.startsWith(' ')) {
+          content = content.substring(1);
+        }
         if (content.isNotEmpty) {
           final data = utf8.encode(content); // raw bytes
           fake.addStdout(data);
