@@ -51,6 +51,8 @@ class MainActivity : FlutterActivity() {
                         val prootPath = call.argument<String>("prootPath")
                         val args = call.argument<List<String>>("args")
                         val env = call.argument<Map<String, String>>("env")
+                        val rows = call.argument<Int>("rows") ?: 24
+                        val cols = call.argument<Int>("cols") ?: 80
                         if (prootPath == null || args == null || env == null) {
                             result.error("BAD_ARGS", "Thiếu prootPath/args/env", null)
                             return@setMethodCallHandler
@@ -61,7 +63,9 @@ class MainActivity : FlutterActivity() {
                                     this,
                                     prootPath,
                                     args,
-                                    env
+                                    env,
+                                    rows = rows,
+                                    cols = cols
                                 ) { line ->
                                     mainHandler.post { logSink?.success(line) }
                                 }
