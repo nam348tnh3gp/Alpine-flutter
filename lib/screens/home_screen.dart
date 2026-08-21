@@ -60,7 +60,13 @@ class _HomeScreenState extends State<HomeScreen> {
     _checkInstalled();
 
     _terminal.onOutput = (data) {
-      _proot.sendInput(data);
+      if (_ctrlActive) {
+        _proot.sendInput(_applyCtrl(data));
+      } else if (_altActive) {
+        _proot.sendInput(_applyAlt(data));
+      } else {
+        _proot.sendInput(data);
+      }
     };
 
     _terminal.onResize = (width, height, pixelWidth, pixelHeight) {
@@ -334,7 +340,7 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ==================== EXTRA KEYS TASKBAR (giống Termux) ====================
+  // ==================== EXTRA KEYS BAR (gọn gàng) ====================
 
   Widget _buildExtraKeysBar() {
     if (!_running) return const SizedBox.shrink();
@@ -342,96 +348,28 @@ class _HomeScreenState extends State<HomeScreen> {
     return Container(
       color: Colors.grey.shade900,
       padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          // Hàng phím chức năng
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              children: [
-                _modifierKey('CTRL', _ctrlActive),
-                _modifierKey('ALT', _altActive),
-                _functionKey('ESC', '\x1b'),
-                _functionKey('TAB', '\t'),
-                _functionKey('ENTER', '\r'),
-                _functionKey('SPACE', ' '),
-                _functionKey('BACKSPACE', '\x7f'),
-              ],
-            ),
-          ),
-          const SizedBox(height: 4),
-          // Hàng phím điều hướng
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              children: [
-                _functionKey('▲', '\x1b[A', ctrl: '\x1b[1;5A', alt: '\x1b[1;3A'),
-                _functionKey('▼', '\x1b[B', ctrl: '\x1b[1;5B', alt: '\x1b[1;3B'),
-                _functionKey('◀', '\x1b[D', ctrl: '\x1b[1;5D', alt: '\x1b[1;3D'),
-                _functionKey('▶', '\x1b[C', ctrl: '\x1b[1;5C', alt: '\x1b[1;3C'),
-                _functionKey('HOME', '\x1b[H'),
-                _functionKey('END', '\x1b[F'),
-                _functionKey('PGUP', '\x1b[5~'),
-                _functionKey('PGDN', '\x1b[6~'),
-                _functionKey('DEL', '\x7f'),
-              ],
-            ),
-          ),
-          const SizedBox(height: 4),
-          // Hàng chữ cái A-Z
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              children: List.generate(26, (index) {
-                final letter = String.fromCharCode(65 + index); // A-Z
-                return _charKey(letter);
-              }),
-            ),
-          ),
-          const SizedBox(height: 4),
-          // Hàng số 0-9 và dấu câu
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              children: [
-                ...List.generate(10, (index) => _charKey('$index')),
-                _charKey('-'),
-                _charKey('_'),
-                _charKey('='),
-                _charKey('+'),
-                _charKey('|'),
-                _charKey('\\'),
-                _charKey('/'),
-                _charKey('?'),
-                _charKey('~'),
-                _charKey('`'),
-                _charKey(':'),
-                _charKey(';'),
-                _charKey('"'),
-                _charKey('\''),
-                _charKey('{'),
-                _charKey('}'),
-                _charKey('['),
-                _charKey(']'),
-                _charKey('<'),
-                _charKey('>'),
-                _charKey('.'),
-                _charKey(','),
-                _charKey('!'),
-                _charKey('@'),
-                _charKey('#'),
-                _charKey('\$'),
-                _charKey('%'),
-                _charKey('^'),
-                _charKey('&'),
-                _charKey('*'),
-                _charKey('('),
-                _charKey(')'),
-              ],
-            ),
-          ),
-        ],
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          children: [
+            _modifierKey('CTRL', _ctrlActive),
+            _modifierKey('ALT', _altActive),
+            _functionKey('ESC', '\x1b'),
+            _functionKey('TAB', '\t'),
+            _functionKey('ENTER', '\r'),
+            _functionKey('SPACE', ' '),
+            _functionKey('BACKSPACE', '\x7f'),
+            _functionKey('▲', '\x1b[A', ctrl: '\x1b[1;5A', alt: '\x1b[1;3A'),
+            _functionKey('▼', '\x1b[B', ctrl: '\x1b[1;5B', alt: '\x1b[1;3B'),
+            _functionKey('◀', '\x1b[D', ctrl: '\x1b[1;5D', alt: '\x1b[1;3D'),
+            _functionKey('▶', '\x1b[C', ctrl: '\x1b[1;5C', alt: '\x1b[1;3C'),
+            _functionKey('HOME', '\x1b[H'),
+            _functionKey('END', '\x1b[F'),
+            _functionKey('PGUP', '\x1b[5~'),
+            _functionKey('PGDN', '\x1b[6~'),
+            _functionKey('DEL', '\x7f'),
+          ],
+        ),
       ),
     );
   }
@@ -486,29 +424,6 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _charKey(String char) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 2),
-      child: InkWell(
-        onTap: () => _sendChar(char),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
-          decoration: BoxDecoration(
-            color: Colors.grey.shade800,
-            borderRadius: BorderRadius.circular(4),
-          ),
-          child: Text(
-            char,
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 12,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
   void _toggleModifier(String mod) {
     setState(() {
       if (mod == 'CTRL') {
@@ -534,27 +449,29 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  void _sendChar(String char) {
-    if (_ctrlActive) {
-      final ctrlVal = _getCtrlChar(char);
-      if (ctrlVal.isNotEmpty) {
-        _proot.sendInput(ctrlVal);
+  // ==================== Xử lý modifier cho bàn phím vật lý ====================
+
+  /// Chuyển đổi chuỗi nhập từ bàn phím khi CTRL active.
+  /// Chỉ áp dụng cho các ký tự a-z hoặc A-Z. Các ký tự khác (escape, enter, v.v.) giữ nguyên.
+  String _applyCtrl(String input) {
+    if (input.length == 1) {
+      final code = input.codeUnitAt(0);
+      if (code >= 65 && code <= 90) {
+        return String.fromCharCode(code - 64); // A=65 -> 1
+      } else if (code >= 97 && code <= 122) {
+        return String.fromCharCode(code - 96); // a=97 -> 1
       }
-    } else if (_altActive) {
-      _proot.sendInput('\x1b$char'); // Alt+char
-    } else {
-      _proot.sendInput(char);
     }
+    return input;
   }
 
-  String _getCtrlChar(String char) {
-    if (char.length == 1 && char.codeUnitAt(0) >= 65 && char.codeUnitAt(0) <= 90) {
-      return String.fromCharCode(char.codeUnitAt(0) - 64); // A->1, B->2 ... Z->26
+  /// Chuyển đổi chuỗi nhập từ bàn phím khi ALT active.
+  /// Thêm tiền tố ESC vào trước ký tự (chuỗi) để tạo Alt+key.
+  String _applyAlt(String input) {
+    if (input.isNotEmpty) {
+      return '\x1b$input';
     }
-    if (char.length == 1 && char.codeUnitAt(0) >= 97 && char.codeUnitAt(0) <= 122) {
-      return String.fromCharCode(char.codeUnitAt(0) - 96); // a->1, b->2 ... z->26
-    }
-    return '';
+    return input;
   }
 
   // ==================== Xử lý selection/copy/paste ====================
