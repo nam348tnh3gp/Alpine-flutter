@@ -19,6 +19,7 @@ class ProotJNI {
     Map<String, String> env, {
     int rows = 24,
     int cols = 80,
+    String sessionId = 'default',
   }) async {
     final result = await _channel.invokeMethod('runProot', {
       'prootPath': prootPath,
@@ -26,25 +27,30 @@ class ProotJNI {
       'env': env,
       'rows': rows,
       'cols': cols,
+      'sessionId': sessionId,
     });
     return result as int;
   }
 
-  static Future<int> writeToPty(List<int> data) async {
+  static Future<int> writeToPty(List<int> data, {String sessionId = 'default'}) async {
     final result = await _channel.invokeMethod('writeToPty', {
       'data': Uint8List.fromList(data),
+      'sessionId': sessionId,
     });
     return result as int;
   }
 
-  static Future<void> killProot() async {
-    await _channel.invokeMethod('killProot');
+  static Future<void> killProot({String sessionId = 'default'}) async {
+    await _channel.invokeMethod('killProot', {
+      'sessionId': sessionId,
+    });
   }
 
-  static Future<void> resizePty(int width, int height) async {
+  static Future<void> resizePty(int width, int height, {String sessionId = 'default'}) async {
     await _channel.invokeMethod('resizePty', {
       'width': width,
       'height': height,
+      'sessionId': sessionId,
     });
   }
 }
