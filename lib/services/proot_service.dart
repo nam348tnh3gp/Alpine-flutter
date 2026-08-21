@@ -40,7 +40,6 @@ class FakeProcess implements Process {
 
   @override
   bool kill([ProcessSignal signal = ProcessSignal.sigterm]) {
-    // Gọi JNI kill thực tế
     ProotJNI.killProot();
     return true;
   }
@@ -56,7 +55,6 @@ class PRootService {
   static const _alpineArchMap = {
     'arm64-v8a': 'aarch64',
     'armeabi-v7a': 'armv7',
-    // Nếu thêm ABI khác, cần cập nhật
   };
 
   final void Function(String line) onLog;
@@ -146,7 +144,6 @@ class PRootService {
           final target = header.linkName;
           if (target == null) break;
           Directory(outPath).parent.createSync(recursive: true);
-          // Xóa file/link cũ nếu tồn tại (kể cả dangling)
           if (Link(outPath).existsSync() || File(outPath).existsSync()) {
             try {
               File(outPath).deleteSync();
@@ -185,7 +182,6 @@ class PRootService {
           '${chmodResult.stderr}');
     }
 
-    // Copy script start-gui.sh vào rootfs
     final scriptAsset = 'assets/rootfs-scripts/start-gui.sh';
     final scriptDest = '$rootfs/usr/local/bin/start-gui.sh';
     try {
@@ -223,8 +219,8 @@ class PRootService {
     required List<String> command,
     void Function(String)? onStdout,
     void Function(String)? onStderr,
-    int rows = 24,  // ✅ Thêm tham số rows
-    int cols = 80,  // ✅ Thêm tham số cols
+    int rows = 24,
+    int cols = 80,
   }) async {
     if (_running) {
       throw Exception('PRootService đang chạy.');
@@ -274,8 +270,8 @@ class PRootService {
       'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
       'HOME': '/root',
       'TERM': 'xterm-256color',
-      'COLUMNS': cols.toString(),  // ✅ Sử dụng cols thực tế
-      'LINES': rows.toString(),    // ✅ Sử dụng rows thực tế
+      'COLUMNS': cols.toString(),
+      'LINES': rows.toString(),
       'PROOT_NO_SECCOMP': '1',
     };
 
@@ -292,16 +288,15 @@ class PRootService {
 
     _logSub = ProotJNI.onLog.listen((line) {
       if (line.startsWith('[pty]')) {
-        // Đây là output từ PTY, chỉ gửi đến onStdout, không ghi log chung
-        // để tránh nhân đôi output.
-        String content = line.substring(5).trim();
+        // Bỏ prefix và truyền nguyên vẹn (không trim, không thêm \n)
+        String content = line.substring(5);
         if (content.isNotEmpty) {
-          final data = utf8.encode(content + '\n');
+          final data = utf8.encode(content); // raw bytes
           fake.addStdout(data);
-          onStdout?.call(content + '\n');
+          onStdout?.call(content); // truyền raw string
         }
       } else {
-        // Log từ launcher (không phải PTY), ghi vào log buffer và gửi onLog/onStderr
+        // Log thường từ launcher
         _log(line);
         final bytes = utf8.encode('$line\n');
         fake.addStderr(bytes);
@@ -309,7 +304,7 @@ class PRootService {
       }
     });
 
-    int exitCode = -1; // ✅ Khởi tạo an toàn thay vì late
+    int exitCode = -1;
     try {
       exitCode = await ProotJNI.runProot(
         prootBin,
