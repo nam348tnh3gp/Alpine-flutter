@@ -40,7 +40,7 @@ class FakeProcess implements Process {
 
   @override
   bool kill([ProcessSignal signal = ProcessSignal.sigterm]) {
-    ProotJNI.killProot(sessionId: _sessionId);
+    ProotJNI.killProot();
     return true;
   }
 
@@ -63,7 +63,6 @@ class PRootService {
   final StringBuffer _logBuffer = StringBuffer();
   StreamSubscription<String>? _logSub;
   bool _running = false;
-
   String _sessionId = '';
 
   PRootService({required this.onLog, this.onProcessExited});
@@ -92,7 +91,129 @@ class PRootService {
   }
 
   Future<void> bootstrap({required void Function(double) onProgress}) async {
-    // ... giữ nguyên code bootstrap như trước (không thay đổi)
+    final abi = await NativeBridge.getAbi();
+    final alpineArch = _alpineArchMap[abi];
+    if (alpineArch == null) {
+      throw Exception('ABI không được hỗ trợ: $abi');
+    }
+    final rootfs = await _rootfsDir();
+    final filesDir = await NativeBridge.getFilesDir();
+
+    if (await Directory(rootfs).exists()) {
+      await Directory(rootfs).delete(recursive: true);
+    }
+    Directory(rootfs).createSync(recursive: true);
+
+    final url =
+        'https://dl-cdn.alpinelinux.org/alpine/v${_alpineVersion.substring(0, 4)}/'
+        'releases/$alpineArch/alpine-minirootfs-$_alpineVersion-$alpineArch.tar.gz';
+
+    _log('📥 Đang tải Alpine minirootfs ($alpineArch)...\n$url');
+
+    final tarGzPath = '$filesDir/alpine-rootfs.tar.gz';
+    final request = http.Request('GET', Uri.parse(url));
+    final response = await http.Client().send(request);
+
+    if (response.statusCode != 200) {
+      throw Exception('Tải rootfs thất bại: HTTP ${response.statusCode}.');
+    }
+
+    final total = response.contentLength ?? 0;
+    var received = 0;
+    final sink = File(tarGzPath).openWrite();
+    await for (final chunk in response.stream) {
+      sink.add(chunk);
+      received += chunk.length;
+      if (total > 0) onProgress(received / total * 0.7);
+    }
+    await sink.close();
+
+    _log('📦 Giải nén rootfs bằng package:tar (hỗ trợ symlink đầy đủ)...');
+    onProgress(0.72);
+
+    var fileCount = 0, dirCount = 0, linkCount = 0;
+    final tarStream = File(tarGzPath).openRead().transform(gzip.decoder);
+    final reader = TarReader(tarStream);
+
+    while (await reader.moveNext()) {
+      final entry = reader.current;
+      final header = entry.header;
+      final outPath = '$rootfs/${entry.name}';
+
+      switch (header.typeFlag) {
+        case TypeFlag.symlink:
+          final target = header.linkName;
+          if (target == null) break;
+          Directory(outPath).parent.createSync(recursive: true);
+          if (Link(outPath).existsSync() || File(outPath).existsSync()) {
+            try {
+              File(outPath).deleteSync();
+            } catch (_) {
+              Link(outPath).deleteSync();
+            }
+          }
+          try {
+            await Link(outPath).create(target, recursive: true);
+          } catch (e) {
+            _log('⚠️ Không tạo được symlink $outPath -> $target: $e');
+          }
+          linkCount++;
+          break;
+        case TypeFlag.dir:
+          Directory(outPath).createSync(recursive: true);
+          dirCount++;
+          break;
+        default:
+          final outFile = File(outPath);
+          outFile.parent.createSync(recursive: true);
+          await entry.contents.pipe(outFile.openWrite());
+          fileCount++;
+          break;
+      }
+    }
+    _log('   -> $fileCount file, $dirCount thư mục, $linkCount symlink');
+    onProgress(0.88);
+
+    await File(tarGzPath).delete().catchError((_) => File(tarGzPath));
+
+    _log('🔧 Cấp quyền execute cho toàn bộ rootfs...');
+    final chmodResult = await Process.run('chmod', ['-R', 'a+rx', rootfs]);
+    if (chmodResult.exitCode != 0) {
+      _log('⚠️ chmod -R a+rX $rootfs thất bại (exit ${chmodResult.exitCode}): '
+          '${chmodResult.stderr}');
+    }
+
+    final scriptAsset = 'assets/rootfs-scripts/start-gui.sh';
+    final scriptDest = '$rootfs/usr/local/bin/start-gui.sh';
+    try {
+      final scriptContent = await rootBundle.loadString(scriptAsset);
+      await File(scriptDest).create(recursive: true);
+      await File(scriptDest).writeAsString(scriptContent);
+      await Process.run('chmod', ['+x', scriptDest]);
+      _log('✅ Đã copy start-gui.sh vào $scriptDest');
+    } catch (e) {
+      _log('⚠️ Không copy được start-gui.sh: $e');
+    }
+
+    final shLink = Link('$rootfs/bin/sh');
+    if (!shLink.existsSync()) {
+      try {
+        if (File('$rootfs/bin/sh').existsSync()) File('$rootfs/bin/sh').deleteSync();
+        await shLink.create('busybox', recursive: true);
+        _log('✅ Đã tạo /bin/sh -> busybox.');
+      } catch (e) {
+        _log('ℹ️ /bin/sh đã tồn tại từ tarball (bình thường).');
+      }
+    }
+
+    for (final d in ['proc', 'sys', 'dev', 'tmp', 'root']) {
+      Directory('$rootfs/$d').createSync(recursive: true);
+    }
+    File('$rootfs/etc/resolv.conf')
+        .writeAsStringSync('nameserver 8.8.8.8\nnameserver 1.1.1.1\n');
+
+    onProgress(1.0);
+    _log('✅ Hoàn tất cài đặt Alpine rootfs tại: $rootfs');
   }
 
   Future<Process> start({
@@ -163,31 +284,27 @@ class PRootService {
 
     _log('🚀 Khởi chạy JNI: $prootBin ${args.join(' ')}');
     _log('   PROOT_LOADER=$loaderPath');
-    _log('   Session ID: $_sessionId');
 
     final fake = FakeProcess(0, -1);
     _currentProcess = fake;
 
     _logSub = ProotJNI.onLog.listen((line) {
-      // Kiểm tra xem dòng log có thuộc session này không
-      final prefix = '[$_sessionId]';
-      if (!line.startsWith(prefix)) {
-        return; // bỏ qua log của session khác
-      }
-      final contentAfterSession = line.substring(prefix.length);
-
-      if (contentAfterSession.startsWith('[pty]')) {
-        String content = contentAfterSession.substring(5);
+      if (line.startsWith('[$_sessionId][pty]')) {
+        // Bỏ prefix và truyền nguyên vẹn (không trim, không thêm \n)
+        String content = line.substring('[$_sessionId][pty]'.length);
         if (content.isNotEmpty) {
-          final data = utf8.encode(content);
+          final data = utf8.encode(content); // raw bytes
           fake.addStdout(data);
-          onStdout?.call(content);
+          onStdout?.call(content); // truyền raw string
         }
       } else {
-        // Log launcher
-        _logBuffer.writeln(contentAfterSession);
-        final bytes = utf8.encode('$contentAfterSession\n');
-        fake.addStderr(bytes);
+        // Log thường từ launcher: chỉ lưu vào buffer để dùng cho nút "Copy log",
+        // không in ra terminal để tránh nhiễu.
+        if (line.startsWith('[$_sessionId]')) {
+          _logBuffer.writeln(line.substring('[$_sessionId]'.length));
+          final bytes = utf8.encode('$line\n');
+          fake.addStderr(bytes);
+        }
       }
     });
 
@@ -229,11 +346,14 @@ class PRootService {
 
   void stop() {
     if (_currentProcess != null) {
-      ProotJNI.killProot(sessionId: _sessionId);
+      _currentProcess?.kill();
       _currentProcess = null;
     }
     _running = false;
     _logSub?.cancel();
     _logSub = null;
+    if (_sessionId.isNotEmpty) {
+      ProotJNI.killProot(sessionId: _sessionId);
+    }
   }
 }
