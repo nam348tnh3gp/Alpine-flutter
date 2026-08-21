@@ -290,21 +290,18 @@ class PRootService {
       if (line.startsWith('[pty]')) {
         // Bỏ prefix và truyền nguyên vẹn (không trim, không thêm \n)
         String content = line.substring(5);
-        // Loại bỏ khoảng trắng thừa do format "%s %.*s" trong native (sửa nhanh)
-        if (content.startsWith(' ')) {
-          content = content.substring(1);
-        }
         if (content.isNotEmpty) {
           final data = utf8.encode(content); // raw bytes
           fake.addStdout(data);
           onStdout?.call(content); // truyền raw string
         }
       } else {
-        // Log thường từ launcher
-        _log(line);
+        // Log thường từ launcher: chỉ lưu vào buffer để dùng cho nút "Copy log",
+        // không in ra terminal để tránh nhiễu.
+        _logBuffer.writeln(line);
         final bytes = utf8.encode('$line\n');
         fake.addStderr(bytes);
-        onStderr?.call(line);
+        // Không gọi onStderr để không hiện log launcher lên terminal
       }
     });
 
