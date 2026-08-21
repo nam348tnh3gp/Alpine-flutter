@@ -9,10 +9,10 @@ enum RunMode { cli, gui }
 
 /// Đối tượng đại diện cho một phiên terminal (tab)
 class TerminalTab {
-  final Terminal terminal;
-  final TerminalController controller;
-  final FocusNode focusNode;
-  final PRootService proot;
+  late final Terminal terminal;
+  late final TerminalController controller;
+  late final FocusNode focusNode;
+  late final PRootService proot;
 
   bool running = false;
   bool stopping = false;
@@ -22,14 +22,15 @@ class TerminalTab {
   bool ctrlActive = false;
   bool altActive = false;
 
-  TerminalTab({VoidCallback? onProcessExited})
-      : terminal = Terminal(maxLines: 5000),
-        controller = TerminalController(),
-        focusNode = FocusNode(),
-        proot = PRootService(
-          onLog: (l) => terminal.write('$l\r\n'),
-          onProcessExited: onProcessExited,
-        );
+  TerminalTab({VoidCallback? onProcessExited}) {
+    terminal = Terminal(maxLines: 5000);
+    controller = TerminalController();
+    focusNode = FocusNode();
+    proot = PRootService(
+      onLog: (l) => terminal.write('$l\r\n'),
+      onProcessExited: onProcessExited,
+    );
+  }
 
   void dispose() {
     proot.stop();
@@ -124,7 +125,8 @@ class _HomeScreenState extends State<HomeScreen> {
   // ==================== Quản lý tab & phiên ====================
 
   Future<TerminalTab> _createNewTab() async {
-    final tab = TerminalTab(
+    late final TerminalTab tab; // khai báo late để dùng trong callback
+    tab = TerminalTab(
       onProcessExited: () {
         if (mounted) {
           setState(() {
