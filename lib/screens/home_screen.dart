@@ -105,6 +105,8 @@ class _HomeScreenState extends State<HomeScreen> {
         command: ['/bin/sh', '-l'],
         onStdout: (s) => _terminal.write(s),
         onStderr: (s) => _terminal.write(s),
+        rows: _terminal.viewHeight,  // Truyền kích thước thực tế
+        cols: _terminal.viewWidth,   // Truyền kích thước thực tế
       );
     } catch (e) {
       _terminal.write('❌ LỖI khởi chạy: $e\r\n');
@@ -130,6 +132,8 @@ class _HomeScreenState extends State<HomeScreen> {
         command: ['/bin/sh', '/usr/local/bin/start-gui.sh'],
         onStdout: (s) => _terminal.write(s),
         onStderr: (s) => _terminal.write(s),
+        rows: _terminal.viewHeight,  // Truyền kích thước thực tế
+        cols: _terminal.viewWidth,   // Truyền kích thước thực tế
       );
       // Chờ 2 giây để VNC server khởi động
       await Future.delayed(const Duration(seconds: 2));
