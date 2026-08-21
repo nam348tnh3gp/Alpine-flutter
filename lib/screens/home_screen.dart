@@ -54,19 +54,7 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _installing = false;
   double _progress = 0;
 
-  String get _appBarTitle {
-    if (!_installed) return 'Alpine Runner - Chưa cài';
-    if (_installing) return 'Alpine Runner - Đang cài đặt...';
-    if (_currentTabIndex != null && _tabs.isNotEmpty) {
-      final tab = _tabs[_currentTabIndex!];
-      if (tab.running) {
-        return tab.mode == RunMode.cli
-            ? 'Alpine Runner - CLI đang chạy'
-            : 'Alpine Runner - GUI đang chạy';
-      }
-    }
-    return 'Alpine Runner (proot, no root)';
-  }
+  String get _appBarTitle => 'Alpine Runner';
 
   @override
   void initState() {
@@ -87,7 +75,15 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _checkInstalled() async {
     final tempService = PRootService(onLog: (_) {});
     final ok = await tempService.isInstalled();
-    if (mounted) setState(() => _installed = ok);
+    if (mounted) {
+      setState(() => _installed = ok);
+      if (_installed && _tabs.isEmpty) {
+        // Tự động tạo phiên CLI đầu tiên
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _newSession();
+        });
+      }
+    }
   }
 
   Future<void> _ensureInstalled() async {
@@ -125,7 +121,7 @@ class _HomeScreenState extends State<HomeScreen> {
   // ==================== Quản lý tab & phiên ====================
 
   Future<TerminalTab> _createNewTab() async {
-    late final TerminalTab tab; // khai báo late để dùng trong callback
+    late final TerminalTab tab;
     tab = TerminalTab(
       onProcessExited: () {
         if (mounted) {
@@ -422,35 +418,19 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(_appBarTitle),
+        title: const Text('Alpine Runner'),
+        leading: IconButton(
+          icon: const Icon(Icons.menu),
+          onPressed: _showMainMenu,
+          tooltip: 'Menu',
+        ),
         actions: [
-          if (_currentTabIndex != null && _tabs.isNotEmpty)
-            IconButton(
-              icon: const Icon(Icons.add_box_outlined),
-              onPressed: _newSession,
-              tooltip: 'Phiên mới',
-            ),
+          // Có thể giữ nút stop nhanh
           if (_currentTabIndex != null && _tabs.isNotEmpty)
             IconButton(
               icon: const Icon(Icons.stop),
               onPressed: _stopCurrentTab,
               tooltip: 'Dừng tiến trình',
-            ),
-          IconButton(
-            icon: const Icon(Icons.copy),
-            onPressed: _copyLog,
-            tooltip: 'Copy log',
-          ),
-          IconButton(
-            icon: const Icon(Icons.clear),
-            onPressed: _clearLog,
-            tooltip: 'Clear log',
-          ),
-          if (_currentTabIndex != null && _tabs.length > 1)
-            IconButton(
-              icon: const Icon(Icons.close),
-              onPressed: _closeCurrentTab,
-              tooltip: 'Đóng tab',
             ),
         ],
       ),
@@ -477,6 +457,89 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
   }
+
+  // ==================== Menu chính (hamburger) ====================
+
+  void _showMainMenu() {
+    showModalBottomSheet(
+      context: context,
+      builder: (context) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Danh sách session
+              const Padding(
+                padding: EdgeInsets.all(8),
+                child: Text('Sessions', style: TextStyle(fontWeight: FontWeight.bold)),
+              ),
+              ..._tabs.asMap().entries.map((entry) {
+                final index = entry.key;
+                final tab = entry.value;
+                return ListTile(
+                  leading: Icon(
+                    index == _currentTabIndex ? Icons.check : Icons.terminal,
+                    color: index == _currentTabIndex ? Colors.teal : null,
+                  ),
+                  title: Text('Term ${index + 1}'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    setState(() => _currentTabIndex = index);
+                    FocusScope.of(context).requestFocus(tab.focusNode);
+                  },
+                );
+              }),
+              const Divider(),
+              ListTile(
+                leading: const Icon(Icons.add_box),
+                title: const Text('New Session'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _newSession();
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.copy),
+                title: const Text('Copy Log'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _copyLog();
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.clear),
+                title: const Text('Clear Log'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _clearLog();
+                },
+              ),
+              if (_currentTabIndex != null && _tabs.isNotEmpty)
+                ListTile(
+                  leading: const Icon(Icons.stop),
+                  title: const Text('Stop Current'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _stopCurrentTab();
+                  },
+                ),
+              if (_currentTabIndex != null && _tabs.isNotEmpty)
+                ListTile(
+                  leading: const Icon(Icons.close),
+                  title: const Text('Close Current Tab'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _closeCurrentTab();
+                  },
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  // ==================== Tab bar ====================
 
   Widget _buildTabBar() {
     return Container(
@@ -571,7 +634,7 @@ class _HomeScreenState extends State<HomeScreen> {
               leading: const Icon(Icons.terminal),
               title: const Text('CLI'),
               subtitle: const Text('Mở shell Alpine trong terminal'),
-              onTap: _newSession, // Mặc định tạo phiên CLI mới
+              onTap: _newSession,
             ),
           ),
           const SizedBox(height: 8),
@@ -648,7 +711,7 @@ class _HomeScreenState extends State<HomeScreen> {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 4),
       child: InkWell(
-        onTap: () => _showTerminalMenu(tab),
+        onTap: () => _showMainMenu(), // Mở menu chính
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
           decoration: BoxDecoration(
@@ -658,61 +721,6 @@ class _HomeScreenState extends State<HomeScreen> {
           child: const Icon(Icons.menu, color: Colors.white, size: 18),
         ),
       ),
-    );
-  }
-
-  void _showTerminalMenu(TerminalTab tab) {
-    showModalBottomSheet(
-      context: context,
-      builder: (context) {
-        return SafeArea(
-          child: Wrap(
-            children: [
-              ListTile(
-                leading: const Icon(Icons.add_box),
-                title: const Text('New Session'),
-                onTap: () {
-                  Navigator.pop(context);
-                  _newSession();
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.copy),
-                title: const Text('Copy Log'),
-                onTap: () {
-                  Navigator.pop(context);
-                  _copyLog();
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.clear),
-                title: const Text('Clear Log'),
-                onTap: () {
-                  Navigator.pop(context);
-                  _clearLog();
-                },
-              ),
-              if (tab.running)
-                ListTile(
-                  leading: const Icon(Icons.stop),
-                  title: const Text('Stop Process'),
-                  onTap: () {
-                    Navigator.pop(context);
-                    _stopCurrentTab();
-                  },
-                ),
-              ListTile(
-                leading: const Icon(Icons.close),
-                title: const Text('Close Tab'),
-                onTap: () {
-                  Navigator.pop(context);
-                  _closeCurrentTab();
-                },
-              ),
-            ],
-          ),
-        );
-      },
     );
   }
 
