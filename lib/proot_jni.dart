@@ -16,12 +16,16 @@ class ProotJNI {
   static Future<int> runProot(
     String prootPath,
     List<String> args,
-    Map<String, String> env,
-  ) async {
+    Map<String, String> env, {
+    int rows = 24,
+    int cols = 80,
+  }) async {
     final result = await _channel.invokeMethod('runProot', {
       'prootPath': prootPath,
       'args': args,
       'env': env,
+      'rows': rows,
+      'cols': cols,
     });
     return result as int;
   }
