@@ -19,17 +19,18 @@ class ProotLauncher {
             env: Array<String>,
             logCallback: ProotLogCallback?,
             rows: Int,
-            cols: Int
+            cols: Int,
+            sessionId: String
         ): Int
 
         @JvmStatic
-        external fun writeToPty(data: ByteArray): Int
+        external fun writeToPty(data: ByteArray, sessionId: String): Int
 
         @JvmStatic
-        external fun killProot()
+        external fun killProot(sessionId: String)
 
         @JvmStatic
-        external fun resizePty(width: Int, height: Int)
+        external fun resizePty(width: Int, height: Int, sessionId: String)
 
         fun launch(
             context: Context,
@@ -38,10 +39,11 @@ class ProotLauncher {
             envVars: Map<String, String>,
             rows: Int = 24,
             cols: Int = 80,
+            sessionId: String = "default",
             onLog: ProotLogCallback? = null
         ): Int {
             val envArray = envVars.map { "${it.key}=${it.value}" }.toTypedArray()
-            return runProot(prootBin, args.toTypedArray(), envArray, onLog, rows, cols)
+            return runProot(prootBin, args.toTypedArray(), envArray, onLog, rows, cols, sessionId)
         }
     }
 }
