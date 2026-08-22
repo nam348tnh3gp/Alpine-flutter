@@ -4,6 +4,12 @@ plugins {
     id "dev.flutter.flutter-gradle-plugin"
 }
 
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file("key.properties")
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+
 android {
     namespace = "com.TNGF.alpinerunner"
     compileSdk = flutter.compileSdkVersion
@@ -19,11 +25,12 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.example.alpinerunner"
+        applicationId = "com.TNGF.alpinerunner"
         minSdk = 26
-        targetSdk = 28   // 🔥 bypass W^X (vẫn giữ vì còn SELinux nhưng JNI giúp bypass)
-        versionCode = 1
-        versionName = "1.0.0"
+        targetSdk = 28   // giữ nguyên để bypass W^X
+
+        // KHÔNG khai báo versionCode / versionName ở đây
+        // Flutter sẽ tự lấy từ pubspec.yaml (version: ...+...).
 
         externalNativeBuild {
             cmake {
@@ -32,7 +39,6 @@ android {
         }
     }
 
-    // 🔥 Tắt lint ExpiredTargetSdkVersion vì app không publish lên Play Store
     lint {
         disable 'ExpiredTargetSdkVersion'
     }
@@ -44,9 +50,18 @@ android {
         }
     }
 
+    signingConfigs {
+        release {
+            keyAlias keystoreProperties['keyAlias']
+            keyPassword keystoreProperties['keyPassword']
+            storeFile keystoreProperties['storeFile'] ? file(keystoreProperties['storeFile']) : null
+            storePassword keystoreProperties['storePassword']
+        }
+    }
+
     buildTypes {
         release {
-            signingConfig = signingConfigs.debug
+            signingConfig signingConfigs.release
             minifyEnabled = false
             shrinkResources = false
         }
