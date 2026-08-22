@@ -10,6 +10,23 @@ if (keystorePropertiesFile.exists()) {
     keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
 }
 
+// Đọc version từ local.properties (do Flutter tự tạo dựa trên pubspec.yaml)
+def localProperties = new Properties()
+def localPropertiesFile = rootProject.file('local.properties')
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.withReader('UTF-8') { reader ->
+        localProperties.load(reader)
+    }
+}
+def flutterVersionCode = localProperties.getProperty('flutter.versionCode')
+if (flutterVersionCode == null) {
+    flutterVersionCode = '1'
+}
+def flutterVersionName = localProperties.getProperty('flutter.versionName')
+if (flutterVersionName == null) {
+    flutterVersionName = '1.0'
+}
+
 android {
     namespace = "com.TGFN.alpinerunner"
     compileSdk = flutter.compileSdkVersion
@@ -29,9 +46,9 @@ android {
         minSdk = 26
         targetSdk = 28   // giữ nguyên để bypass W^X
 
-        // Lấy versionCode và versionName từ pubspec.yaml thông qua Flutter Gradle Plugin
-        versionCode = flutter.versionCode
-        versionName = flutter.versionName
+        // Lấy version từ local.properties
+        versionCode = flutterVersionCode.toInteger()
+        versionName = flutterVersionName
 
         externalNativeBuild {
             cmake {
