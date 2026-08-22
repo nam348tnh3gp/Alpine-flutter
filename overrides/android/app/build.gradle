@@ -11,7 +11,7 @@ if (keystorePropertiesFile.exists()) {
 }
 
 android {
-    namespace = "com.TNGF.alpinerunner"
+    namespace = "com.TGFN.alpinerunner"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
