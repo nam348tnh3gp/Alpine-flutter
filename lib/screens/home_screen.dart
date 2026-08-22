@@ -141,8 +141,10 @@ class _HomeScreenState extends State<HomeScreen> {
     tab.terminal.onOutput = (data) {
       if (tab.ctrlActive) {
         tab.proot.sendInput(_applyCtrl(data));
+        setState(() => tab.ctrlActive = false); // Tự tắt sau khi gửi
       } else if (tab.altActive) {
         tab.proot.sendInput(_applyAlt(data));
+        setState(() => tab.altActive = false); // Tự tắt sau khi gửi
       } else {
         tab.proot.sendInput(data);
       }
@@ -425,7 +427,6 @@ class _HomeScreenState extends State<HomeScreen> {
           tooltip: 'Menu',
         ),
         actions: [
-          // Có thể giữ nút stop nhanh
           if (_currentTabIndex != null && _tabs.isNotEmpty)
             IconButton(
               icon: const Icon(Icons.stop),
@@ -468,7 +469,6 @@ class _HomeScreenState extends State<HomeScreen> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              // Danh sách session
               const Padding(
                 padding: EdgeInsets.all(8),
                 child: Text('Sessions', style: TextStyle(fontWeight: FontWeight.bold)),
@@ -681,7 +681,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 _functionKey(tab, 'ENTER', '\r'),
                 _functionKey(tab, 'SPACE', ' '),
                 _functionKey(tab, 'BACKSPACE', '\x7f'),
-                _functionKey(tab, 'DEL', '\x7f'),
+                _functionKey(tab, 'DEL', '\x1b[3~'),  // Sửa DEL đúng escape sequence
               ],
             ),
           ),
@@ -711,7 +711,7 @@ class _HomeScreenState extends State<HomeScreen> {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 4),
       child: InkWell(
-        onTap: () => _showMainMenu(), // Mở menu chính
+        onTap: () => _showMainMenu(),
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
           decoration: BoxDecoration(
@@ -798,6 +798,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
     if (value.isNotEmpty) {
       tab.proot.sendInput(value);
+      // Tự tắt modifier sau khi gửi (giống hành vi phím tắt thông thường)
+      setState(() {
+        tab.ctrlActive = false;
+        tab.altActive = false;
+      });
     }
   }
 }
