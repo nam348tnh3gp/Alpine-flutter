@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.alpinerunner"
+    namespace = "com.TNGF.alpinerunner"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
