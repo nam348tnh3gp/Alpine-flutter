@@ -96,15 +96,15 @@ jobs:
           cp -f overrides/android/app/src/main/AndroidManifest.xml \
                 build_workspace/android/app/src/main/AndroidManifest.xml
 
-          # Tạo thư mục Kotlin package com.TNGF.alpinerunner
+          # Tạo thư mục Kotlin package com.TGFN.alpinerunner
           mkdir -p build_workspace/android/app/src/main/kotlin/${ORG//./\/}/${APP_NAME}
 
           # Copy MainActivity.kt
-          cp -f overrides/android/app/src/main/kotlin/com/TNGF/alpinerunner/MainActivity.kt \
+          cp -f overrides/android/app/src/main/kotlin/com/TGFN/alpinerunner/MainActivity.kt \
                 build_workspace/android/app/src/main/kotlin/${ORG//./\/}/${APP_NAME}/MainActivity.kt
 
           # Copy ProotLauncher.kt
-          cp -f overrides/android/app/src/main/kotlin/com/TNGF/alpinerunner/ProotLauncher.kt \
+          cp -f overrides/android/app/src/main/kotlin/com/TGFN/alpinerunner/ProotLauncher.kt \
                 build_workspace/android/app/src/main/kotlin/${ORG//./\/}/${APP_NAME}/ProotLauncher.kt
 
           # Copy app/build.gradle
