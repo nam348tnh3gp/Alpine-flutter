@@ -1,4 +1,4 @@
-package com.TNGF.alpinerunner
+package com.TGFN.alpinerunner
 
 import android.os.Build
 import android.os.Handler
