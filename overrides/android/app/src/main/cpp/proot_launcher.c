@@ -13,6 +13,7 @@
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <dirent.h>
+#include <pthread.h>
 
 #define LOG_TAG "ProotLauncher"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -35,38 +36,50 @@ typedef struct {
 
 static Session g_sessions[MAX_SESSIONS];
 static int g_session_count = 0;
+static pthread_mutex_t g_session_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static int find_session(const char *session_id, Session **out) {
+static int find_session(const char *session_id, int *out_master_fd, pid_t *out_child_pid) {
+    pthread_mutex_lock(&g_session_mutex);
     for (int i = 0; i < g_session_count; i++) {
         if (strcmp(g_sessions[i].session_id, session_id) == 0) {
-            *out = &g_sessions[i];
+            if (out_master_fd) *out_master_fd = g_sessions[i].master_fd;
+            if (out_child_pid) *out_child_pid = g_sessions[i].child_pid;
+            pthread_mutex_unlock(&g_session_mutex);
             return 0;
         }
     }
+    pthread_mutex_unlock(&g_session_mutex);
     return -1;
 }
 
 static int add_session(const char *session_id, int master_fd, pid_t child_pid) {
-    if (g_session_count >= MAX_SESSIONS) return -1;
+    pthread_mutex_lock(&g_session_mutex);
+    if (g_session_count >= MAX_SESSIONS) {
+        pthread_mutex_unlock(&g_session_mutex);
+        return -1;
+    }
     Session *s = &g_sessions[g_session_count++];
     s->master_fd = master_fd;
     s->child_pid = child_pid;
     strncpy(s->session_id, session_id, sizeof(s->session_id) - 1);
     s->session_id[sizeof(s->session_id) - 1] = '\0';
+    pthread_mutex_unlock(&g_session_mutex);
     return 0;
 }
 
 static int remove_session(const char *session_id) {
+    pthread_mutex_lock(&g_session_mutex);
     for (int i = 0; i < g_session_count; i++) {
         if (strcmp(g_sessions[i].session_id, session_id) == 0) {
-            // Shift remaining
             for (int j = i; j < g_session_count - 1; j++) {
                 g_sessions[j] = g_sessions[j + 1];
             }
             g_session_count--;
+            pthread_mutex_unlock(&g_session_mutex);
             return 0;
         }
     }
+    pthread_mutex_unlock(&g_session_mutex);
     return -1;
 }
 
@@ -224,7 +237,6 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         int slave_fd = open(devname, O_RDWR);
         if (slave_fd < 0) _exit(127);
 
-        // Cấu hình termios trên slave_fd
         struct termios tios;
         if (tcgetattr(slave_fd, &tios) == 0) {
             tios.c_iflag |= IUTF8;
@@ -243,7 +255,6 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         dup2(slave_fd, 1);
         dup2(slave_fd, 2);
 
-        // Đóng tất cả fd > 2 (trừ slave_fd)
         DIR *self_dir = opendir("/proc/self/fd");
         if (self_dir != NULL) {
             int self_dir_fd = dirfd(self_dir);
@@ -291,7 +302,6 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         return -1;
     }
 
-    // Đặt non-blocking cho master_fd
     fcntl(master_fd, F_SETFL, O_NONBLOCK);
 
     int status = 0;
@@ -331,6 +341,7 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         emit_log(&ctx, "[pty]", chunk, (size_t)n);
     }
 
+    // Chỉ runProot mới được close và remove session
     close(master_fd);
     remove_session(session_id);
 
@@ -367,8 +378,9 @@ Java_com_example_alpinerunner_ProotLauncher_writeToPty(
     const char *session_id = (*env)->GetStringUTFChars(env, sessionId, NULL);
     if (session_id == NULL) return -1;
 
-    Session *s;
-    if (find_session(session_id, &s) != 0) {
+    int master_fd;
+    pid_t child_pid;
+    if (find_session(session_id, &master_fd, &child_pid) != 0) {
         LOGE("writeToPty: không tìm thấy session %s", session_id);
         (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
         return -1;
@@ -380,7 +392,7 @@ Java_com_example_alpinerunner_ProotLauncher_writeToPty(
         (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
         return -1;
     }
-    ssize_t written = write(s->master_fd, bytes, len);
+    ssize_t written = write(master_fd, bytes, len);
     if (written < 0) {
         LOGE("writeToPty: write thất bại: %s", strerror(errno));
     }
@@ -397,19 +409,19 @@ Java_com_example_alpinerunner_ProotLauncher_killProot(
     const char *session_id = (*env)->GetStringUTFChars(env, sessionId, NULL);
     if (session_id == NULL) return;
 
-    Session *s;
-    if (find_session(session_id, &s) == 0) {
-        if (s->child_pid > 0) {
-            kill(s->child_pid, SIGTERM);
+    int master_fd;
+    pid_t child_pid;
+    if (find_session(session_id, &master_fd, &child_pid) == 0) {
+        if (child_pid > 0) {
+            kill(child_pid, SIGTERM);
             usleep(100000);
-            if (kill(s->child_pid, 0) == 0) {
-                kill(s->child_pid, SIGKILL);
+            if (kill(child_pid, 0) == 0) {
+                kill(child_pid, SIGKILL);
             }
         }
-        if (s->master_fd != -1) {
-            close(s->master_fd);
-        }
-        remove_session(session_id);
+        // KHÔNG close(master_fd) và KHÔNG remove_session ở đây nữa.
+        // Luồng runProot sẽ tự phát hiện con đã thoát (waitpid) và tự
+        // đóng fd + remove_session — chỉ 1 nơi duy nhất được đóng fd.
     }
     (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
 }
@@ -424,8 +436,9 @@ Java_com_example_alpinerunner_ProotLauncher_resizePty(
     const char *session_id = (*env)->GetStringUTFChars(env, sessionId, NULL);
     if (session_id == NULL) return;
 
-    Session *s;
-    if (find_session(session_id, &s) != 0) {
+    int master_fd;
+    pid_t child_pid;
+    if (find_session(session_id, &master_fd, &child_pid) != 0) {
         (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
         return;
     }
@@ -438,9 +451,9 @@ Java_com_example_alpinerunner_ProotLauncher_resizePty(
         .ws_xpixel = (unsigned short) (width * 8),
         .ws_ypixel = (unsigned short) (height * 16)
     };
-    ioctl(s->master_fd, TIOCSWINSZ, &sz);
-    if (s->child_pid > 0) {
-        kill(s->child_pid, SIGWINCH);
+    ioctl(master_fd, TIOCSWINSZ, &sz);
+    if (child_pid > 0) {
+        kill(child_pid, SIGWINCH);
     }
     (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
 }
