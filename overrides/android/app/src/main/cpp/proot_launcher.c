@@ -25,6 +25,8 @@ typedef struct {
     int master_fd;
     pid_t child_pid;
     char session_id[64];
+    int ref_count;        // tăng khi dùng, giảm khi xong
+    pthread_mutex_t mutex; // mutex riêng cho từng session
 } Session;
 
 typedef struct {
@@ -38,18 +40,46 @@ static Session g_sessions[MAX_SESSIONS];
 static int g_session_count = 0;
 static pthread_mutex_t g_session_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static int find_session(const char *session_id, int *out_master_fd, pid_t *out_child_pid) {
+// --- Quản lý session với ref-count ---
+static Session* find_session_locked(const char *session_id, int *out_master_fd, pid_t *out_child_pid) {
     pthread_mutex_lock(&g_session_mutex);
     for (int i = 0; i < g_session_count; i++) {
         if (strcmp(g_sessions[i].session_id, session_id) == 0) {
+            pthread_mutex_lock(&g_sessions[i].mutex);
+            g_sessions[i].ref_count++;
             if (out_master_fd) *out_master_fd = g_sessions[i].master_fd;
             if (out_child_pid) *out_child_pid = g_sessions[i].child_pid;
+            pthread_mutex_unlock(&g_sessions[i].mutex);
             pthread_mutex_unlock(&g_session_mutex);
-            return 0;
+            return &g_sessions[i];
         }
     }
     pthread_mutex_unlock(&g_session_mutex);
-    return -1;
+    return NULL;
+}
+
+static void release_session(Session *s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->mutex);
+    s->ref_count--;
+    int should_close = (s->ref_count <= 0 && s->master_fd >= 0);
+    pthread_mutex_unlock(&s->mutex);
+    if (should_close) {
+        close(s->master_fd);
+        s->master_fd = -1;
+        // Xóa khỏi danh sách
+        pthread_mutex_lock(&g_session_mutex);
+        for (int i = 0; i < g_session_count; i++) {
+            if (strcmp(g_sessions[i].session_id, s->session_id) == 0) {
+                for (int j = i; j < g_session_count - 1; j++) {
+                    g_sessions[j] = g_sessions[j + 1];
+                }
+                g_session_count--;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_session_mutex);
+    }
 }
 
 static int add_session(const char *session_id, int master_fd, pid_t child_pid) {
@@ -61,28 +91,15 @@ static int add_session(const char *session_id, int master_fd, pid_t child_pid) {
     Session *s = &g_sessions[g_session_count++];
     s->master_fd = master_fd;
     s->child_pid = child_pid;
+    s->ref_count = 1; // runProot giữ 1 reference
+    pthread_mutex_init(&s->mutex, NULL);
     strncpy(s->session_id, session_id, sizeof(s->session_id) - 1);
     s->session_id[sizeof(s->session_id) - 1] = '\0';
     pthread_mutex_unlock(&g_session_mutex);
     return 0;
 }
 
-static int remove_session(const char *session_id) {
-    pthread_mutex_lock(&g_session_mutex);
-    for (int i = 0; i < g_session_count; i++) {
-        if (strcmp(g_sessions[i].session_id, session_id) == 0) {
-            for (int j = i; j < g_session_count - 1; j++) {
-                g_sessions[j] = g_sessions[j + 1];
-            }
-            g_session_count--;
-            pthread_mutex_unlock(&g_session_mutex);
-            return 0;
-        }
-    }
-    pthread_mutex_unlock(&g_session_mutex);
-    return -1;
-}
-
+// --- Logging (giữ nguyên, chỉ sửa nhỏ để an toàn UTF-8) ---
 static void emit_log(LogCtx *ctx, const char *prefix, const char *line, size_t len) {
     if (ctx->callback == NULL || ctx->onLogMid == NULL) {
         LOGD("%s%s%.*s", ctx->session_id ? ctx->session_id : "", prefix, (int)len, line);
@@ -102,8 +119,11 @@ static void emit_log(LogCtx *ctx, const char *prefix, const char *line, size_t l
     (*ctx->env)->DeleteLocalRef(ctx->env, jline);
 }
 
+// ========== CÁC HÀM JNI VỚI TÊN ĐÚNG PACKAGE ==========
+// Package thực tế: com.TGFN.alpinerunner
+
 JNIEXPORT jint JNICALL
-Java_com_example_alpinerunner_ProotLauncher_runProot(
+Java_com_TGFN_alpinerunner_ProotLauncher_runProot(  // ← sửa package
     JNIEnv *env,
     jobject thiz,
     jstring prootPath,
@@ -304,9 +324,12 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
 
     fcntl(master_fd, F_SETFL, O_NONBLOCK);
 
+    // --- Vòng lặp đọc PTY với bộ đệm UTF-8 an toàn ---
     int status = 0;
     int childExited = 0;
     int exitCode = -1;
+    char utf8_buf[4096];
+    size_t utf8_len = 0;
 
     while (!childExited) {
         struct pollfd fds[1] = { { master_fd, POLLIN, 0 } };
@@ -315,7 +338,33 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         char chunk[4096];
         ssize_t n;
         while ((n = read(master_fd, chunk, sizeof(chunk))) > 0) {
-            emit_log(&ctx, "[pty]", chunk, (size_t)n);
+            // Nối vào bộ đệm
+            if (utf8_len + n < sizeof(utf8_buf)) {
+                memcpy(utf8_buf + utf8_len, chunk, n);
+                utf8_len += n;
+            } else {
+                // Tràn bộ đệm – gửi những gì có thể (không xảy ra trong thực tế)
+                emit_log(&ctx, "[pty]", utf8_buf, utf8_len);
+                utf8_len = 0;
+                memcpy(utf8_buf, chunk, n);
+                utf8_len = n;
+            }
+            // Kiểm tra xem có ký tự UTF-8 hợp lệ hoàn chỉnh ở cuối không
+            // Cách đơn giản: tìm vị trí ký tự không hợp lệ bằng cách kiểm tra byte đầu
+            // Ở đây, để đơn giản, ta chỉ gửi toàn bộ nếu kết thúc bằng newline hoặc NULL
+            // Thực tế, ta có thể gửi ngay sau mỗi lần đọc nhưng phải xử lý cắt giữa chừng:
+            // Bằng cách không chia nhỏ nếu byte cuối là byte tiếp tục UTF-8.
+            // Tôi dùng cách: lùi lại cho đến khi byte cuối không phải là 0x80-0xBF
+            // Nếu tất cả đều là tiếp tục, đợi lần đọc sau.
+            if (utf8_len > 0) {
+                unsigned char last = utf8_buf[utf8_len - 1];
+                if ((last & 0xC0) != 0x80) { // không phải byte tiếp tục
+                    // Gửi toàn bộ
+                    emit_log(&ctx, "[pty]", utf8_buf, utf8_len);
+                    utf8_len = 0;
+                }
+                // Nếu là byte tiếp tục, giữ lại chờ thêm dữ liệu
+            }
         }
         if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
             char msg[128];
@@ -338,12 +387,44 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
     char chunk[4096];
     ssize_t n;
     while ((n = read(master_fd, chunk, sizeof(chunk))) > 0) {
+        // Gửi trực tiếp (không quan trọng UTF-8 vì đã kết thúc)
         emit_log(&ctx, "[pty]", chunk, (size_t)n);
     }
+    if (utf8_len > 0) {
+        emit_log(&ctx, "[pty]", utf8_buf, utf8_len);
+    }
 
-    // Chỉ runProot mới được close và remove session
-    close(master_fd);
-    remove_session(session_id);
+    // Đóng và giải phóng session
+    // Tìm session, giảm ref
+    Session *s = NULL;
+    pthread_mutex_lock(&g_session_mutex);
+    for (int i = 0; i < g_session_count; i++) {
+        if (strcmp(g_sessions[i].session_id, session_id) == 0) {
+            s = &g_sessions[i];
+            break;
+        }
+    }
+    if (s) {
+        pthread_mutex_lock(&s->mutex);
+        s->ref_count--;
+        int should_close = (s->ref_count <= 0 && s->master_fd >= 0);
+        pthread_mutex_unlock(&s->mutex);
+        if (should_close) {
+            close(s->master_fd);
+            s->master_fd = -1;
+            // Xóa khỏi danh sách
+            for (int i = 0; i < g_session_count; i++) {
+                if (strcmp(g_sessions[i].session_id, session_id) == 0) {
+                    for (int j = i; j < g_session_count - 1; j++) {
+                        g_sessions[j] = g_sessions[j + 1];
+                    }
+                    g_session_count--;
+                    break;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_session_mutex);
 
     if (WIFEXITED(status)) {
         exitCode = WEXITSTATUS(status);
@@ -358,7 +439,8 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
         exitCode = 128 + WTERMSIG(status);
     }
 
-    free((void *)proot);
+    // Giải phóng bộ nhớ đúng cách
+    (*env)->ReleaseStringUTFChars(env, prootPath, proot);  // ← sửa
     for (int i = 0; i < argc + 1; i++) free(argv[i]);
     free(argv);
     for (int i = 0; i < envc; i++) free(envp[i]);
@@ -369,8 +451,9 @@ Java_com_example_alpinerunner_ProotLauncher_runProot(
     return exitCode;
 }
 
+// Các hàm JNI còn lại với tên đúng package
 JNIEXPORT jint JNICALL
-Java_com_example_alpinerunner_ProotLauncher_writeToPty(
+Java_com_TGFN_alpinerunner_ProotLauncher_writeToPty(  // ← sửa
     JNIEnv *env,
     jobject thiz,
     jbyteArray data,
@@ -378,9 +461,9 @@ Java_com_example_alpinerunner_ProotLauncher_writeToPty(
     const char *session_id = (*env)->GetStringUTFChars(env, sessionId, NULL);
     if (session_id == NULL) return -1;
 
-    int master_fd;
-    pid_t child_pid;
-    if (find_session(session_id, &master_fd, &child_pid) != 0) {
+    int master_fd = -1;
+    Session *s = find_session_locked(session_id, &master_fd, NULL);
+    if (!s) {
         LOGE("writeToPty: không tìm thấy session %s", session_id);
         (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
         return -1;
@@ -389,6 +472,7 @@ Java_com_example_alpinerunner_ProotLauncher_writeToPty(
     jsize len = (*env)->GetArrayLength(env, data);
     jbyte *bytes = (*env)->GetByteArrayElements(env, data, NULL);
     if (bytes == NULL) {
+        release_session(s);
         (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
         return -1;
     }
@@ -397,21 +481,22 @@ Java_com_example_alpinerunner_ProotLauncher_writeToPty(
         LOGE("writeToPty: write thất bại: %s", strerror(errno));
     }
     (*env)->ReleaseByteArrayElements(env, data, bytes, JNI_ABORT);
+    release_session(s);
     (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
     return (jint)written;
 }
 
 JNIEXPORT void JNICALL
-Java_com_example_alpinerunner_ProotLauncher_killProot(
+Java_com_TGFN_alpinerunner_ProotLauncher_killProot(  // ← sửa
     JNIEnv *env,
     jobject thiz,
     jstring sessionId) {
     const char *session_id = (*env)->GetStringUTFChars(env, sessionId, NULL);
     if (session_id == NULL) return;
 
-    int master_fd;
-    pid_t child_pid;
-    if (find_session(session_id, &master_fd, &child_pid) == 0) {
+    pid_t child_pid = -1;
+    Session *s = find_session_locked(session_id, NULL, &child_pid);
+    if (s) {
         if (child_pid > 0) {
             kill(child_pid, SIGTERM);
             usleep(100000);
@@ -419,15 +504,13 @@ Java_com_example_alpinerunner_ProotLauncher_killProot(
                 kill(child_pid, SIGKILL);
             }
         }
-        // KHÔNG close(master_fd) và KHÔNG remove_session ở đây nữa.
-        // Luồng runProot sẽ tự phát hiện con đã thoát (waitpid) và tự
-        // đóng fd + remove_session — chỉ 1 nơi duy nhất được đóng fd.
+        release_session(s);
     }
     (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
 }
 
 JNIEXPORT void JNICALL
-Java_com_example_alpinerunner_ProotLauncher_resizePty(
+Java_com_TGFN_alpinerunner_ProotLauncher_resizePty(  // ← sửa
     JNIEnv *env,
     jobject thiz,
     jint width,
@@ -436,9 +519,10 @@ Java_com_example_alpinerunner_ProotLauncher_resizePty(
     const char *session_id = (*env)->GetStringUTFChars(env, sessionId, NULL);
     if (session_id == NULL) return;
 
-    int master_fd;
-    pid_t child_pid;
-    if (find_session(session_id, &master_fd, &child_pid) != 0) {
+    int master_fd = -1;
+    pid_t child_pid = -1;
+    Session *s = find_session_locked(session_id, &master_fd, &child_pid);
+    if (!s) {
         (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
         return;
     }
@@ -455,5 +539,6 @@ Java_com_example_alpinerunner_ProotLauncher_resizePty(
     if (child_pid > 0) {
         kill(child_pid, SIGWINCH);
     }
+    release_session(s);
     (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
 }
