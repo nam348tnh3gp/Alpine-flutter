@@ -96,16 +96,9 @@ jobs:
           cp -f overrides/android/app/src/main/AndroidManifest.xml \
                 build_workspace/android/app/src/main/AndroidManifest.xml
 
-          # Tạo thư mục Kotlin package com.TGFN.alpinerunner
-          mkdir -p build_workspace/android/app/src/main/kotlin/${ORG//./\/}/${APP_NAME}
-
-          # Copy MainActivity.kt
-          cp -f overrides/android/app/src/main/kotlin/com/TGFN/alpinerunner/MainActivity.kt \
-                build_workspace/android/app/src/main/kotlin/${ORG//./\/}/${APP_NAME}/MainActivity.kt
-
-          # Copy ProotLauncher.kt
-          cp -f overrides/android/app/src/main/kotlin/com/TGFN/alpinerunner/ProotLauncher.kt \
-                build_workspace/android/app/src/main/kotlin/${ORG//./\/}/${APP_NAME}/ProotLauncher.kt
+          # Copy toàn bộ thư mục kotlin (giữ nguyên cấu trúc com.TGFN.alpinerunner)
+          cp -r overrides/android/app/src/main/kotlin/com \
+                build_workspace/android/app/src/main/kotlin/
 
           # Copy app/build.gradle
           cp -f overrides/android/app/build.gradle build_workspace/android/app/build.gradle
@@ -117,9 +110,9 @@ jobs:
           cp -f overrides/android/app/src/main/cpp/proot_launcher.c \
                 build_workspace/android/app/src/main/cpp/
 
-          # Xoá MainActivity mặc định nếu khác
+          # Xoá MainActivity mặc định của Flutter (nếu có)
           find build_workspace/android/app/src/main/kotlin -name "MainActivity.kt" \
-            -not -path "*${APP_NAME}/MainActivity.kt" -delete || true
+            -not -path "*/com/TGFN/alpinerunner/MainActivity.kt" -delete || true
 
       - name: Set Kotlin version
         run: |
