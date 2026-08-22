@@ -58,8 +58,6 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _installing = false;
   double _progress = 0;
 
-  String get _appBarTitle => 'Alpine Runner';
-
   @override
   void initState() {
     super.initState();
@@ -90,35 +88,62 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  // ========== BẢN VÁ: Sửa lỗi kẹt UI sau cài đặt ==========
   Future<void> _ensureInstalled() async {
     if (_installed) return;
     setState(() => _installing = true);
-    final tempService = PRootService(
-      onLog: (l) {
-        if (_tabs.isNotEmpty) {
-          _tabs.first.terminal.write('$l\r\n');
-        } else {
-          final tab = TerminalTab();
-          setState(() {
-            _tabs.add(tab);
-            _currentTabIndex = _tabs.length - 1;
-          });
-          tab.terminal.write('$l\r\n');
-        }
-      },
+
+    // Tạo một tab tạm để hiển thị log trong quá trình cài
+    final tempTab = TerminalTab();
+    setState(() {
+      _tabs.add(tempTab);
+      _currentTabIndex = _tabs.length - 1;
+    });
+
+    final service = PRootService(
+      onLog: (l) => tempTab.terminal.write('$l\r\n'),
     );
+
     try {
-      await tempService.bootstrap(onProgress: (p) {
+      await service.bootstrap(onProgress: (p) {
         if (mounted) setState(() => _progress = p);
       });
-      if (mounted) setState(() => _installed = true);
-    } catch (e) {
-      if (_tabs.isNotEmpty) {
-        _tabs.first.terminal.write('❌ LỖI cài đặt: $e\r\n');
+
+      if (mounted) {
+        // Xóa tab tạm
+        _tabs.remove(tempTab);
+        // Nếu không còn tab nào, đặt _currentTabIndex = null
+        if (_tabs.isEmpty) {
+          _currentTabIndex = null;
+        } else {
+          _currentTabIndex = 0;
+        }
+
+        setState(() {
+          _installed = true;
+          _installing = false;
+        });
+
+        // Tạo một phiên thật đầu tiên
+        await _newSession();
       }
-      _showErrorSnackBar('Lỗi cài đặt: $e');
+    } catch (e) {
+      if (mounted) {
+        tempTab.terminal.write('❌ LỖI cài đặt: $e\r\n');
+        _showErrorSnackBar('Lỗi cài đặt: $e');
+        // Xóa tab tạm và reset trạng thái
+        _tabs.remove(tempTab);
+        if (_tabs.isEmpty) _currentTabIndex = null;
+        setState(() => _installing = false);
+      }
     } finally {
-      if (mounted) setState(() => _installing = false);
+      service.stop();
+      // Nếu có lỗi mà tab tạm vẫn còn, đảm bảo dispose
+      if (_tabs.contains(tempTab)) {
+        tempTab.dispose();
+        _tabs.remove(tempTab);
+        if (_tabs.isEmpty) _currentTabIndex = null;
+      }
     }
   }
 
