@@ -22,6 +22,9 @@ class TerminalTab {
   bool ctrlActive = false;
   bool altActive = false;
 
+  // Cỡ chữ mặc định, có thể zoom bằng pinch
+  double fontSize = 14.0;
+
   TerminalTab({VoidCallback? onProcessExited}) {
     terminal = Terminal(maxLines: 5000);
     controller = TerminalController();
@@ -354,10 +357,9 @@ class _HomeScreenState extends State<HomeScreen> {
     return processed;
   }
 
-  // ==================== Xử lý copy/paste ====================
+  // ==================== Menu ngữ cảnh terminal (copy/paste) ====================
 
-  Future<void> _handleSecondaryTapDown(
-      TerminalTab tab, TapDownDetails details, CellOffset offset) async {
+  Future<void> _showTerminalContextMenu(TerminalTab tab) async {
     final selection = tab.controller.selection;
     final hasSelection = selection != null;
 
@@ -584,13 +586,25 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildTerminalView(TerminalTab tab) {
-    return TerminalView(
-      tab.terminal,
-      controller: tab.controller,
-      focusNode: tab.focusNode,
-      autofocus: true,
-      onSecondaryTapDown: (details, offset) =>
-          _handleSecondaryTapDown(tab, details, offset),
+    double baseFontSize = tab.fontSize;
+
+    return GestureDetector(
+      onLongPress: () => _showTerminalContextMenu(tab),
+      onScaleStart: (_) => baseFontSize = tab.fontSize,
+      onScaleUpdate: (details) {
+        if (details.pointerCount < 2) return; // chỉ áp dụng khi 2 ngón
+        setState(() {
+          tab.fontSize = (baseFontSize * details.scale).clamp(8.0, 32.0);
+        });
+      },
+      child: TerminalView(
+        tab.terminal,
+        controller: tab.controller,
+        focusNode: tab.focusNode,
+        autofocus: true,
+        textStyle: TerminalStyle(fontSize: tab.fontSize),
+        onSecondaryTapDown: (details, offset) => _showTerminalContextMenu(tab),
+      ),
     );
   }
 
@@ -681,7 +695,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 _functionKey(tab, 'ENTER', '\r'),
                 _functionKey(tab, 'SPACE', ' '),
                 _functionKey(tab, 'BACKSPACE', '\x7f'),
-                _functionKey(tab, 'DEL', '\x1b[3~'),  // Sửa DEL đúng escape sequence
+                _functionKey(tab, 'DEL', '\x1b[3~'),
               ],
             ),
           ),
