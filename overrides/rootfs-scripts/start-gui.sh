@@ -19,10 +19,15 @@ rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 2>/dev/null || true
 echo "[*] Khởi động Xvfb :1 ..."
 Xvfb :1 -screen 0 1280x720x24 -nolisten tcp &
 XVFB_PID=$!
-sleep 1
+sleep 2
 
 echo "[*] Khởi động window manager (icewm) ..."
 icewm-session &
+sleep 1
 
 echo "[*] Khởi động x11vnc trên cổng 5900 (chỉ localhost) ..."
-exec x11vnc -display :1 -nopw -forever -shared -localhost -rfbport 5900
+# FIX: thêm -noshm để tránh lỗi shmget trong proot
+x11vnc -display :1 -nopw -forever -shared -localhost -rfbport 5900 -noshm -xkb
+
+# Giữ shell sống (để proot không exit)
+wait
