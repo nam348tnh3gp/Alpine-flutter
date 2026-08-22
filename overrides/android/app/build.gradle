@@ -25,7 +25,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.TNGF.alpinerunner"
+        applicationId = "com.TGFN.alpinerunner"
         minSdk = 26
         targetSdk = 28   // giữ nguyên để bypass W^X
 
