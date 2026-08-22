@@ -29,8 +29,9 @@ android {
         minSdk = 26
         targetSdk = 28   // giữ nguyên để bypass W^X
 
-        // KHÔNG khai báo versionCode / versionName ở đây
-        // Flutter sẽ tự lấy từ pubspec.yaml (version: ...+...).
+        // Lấy versionCode và versionName từ pubspec.yaml thông qua Flutter Gradle Plugin
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
 
         externalNativeBuild {
             cmake {
