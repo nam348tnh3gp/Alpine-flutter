@@ -24,6 +24,7 @@ class TerminalTab {
 
   // Cỡ chữ mặc định, có thể zoom bằng pinch
   double fontSize = 14.0;
+  double pinchBaseFontSize = 14.0; // chỉ set 1 lần khi bắt đầu pinch
 
   TerminalTab({VoidCallback? onProcessExited}) {
     terminal = Terminal(maxLines: 5000);
@@ -586,15 +587,13 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildTerminalView(TerminalTab tab) {
-    double baseFontSize = tab.fontSize;
-
     return GestureDetector(
       onLongPress: () => _showTerminalContextMenu(tab),
-      onScaleStart: (_) => baseFontSize = tab.fontSize,
+      onScaleStart: (_) => tab.pinchBaseFontSize = tab.fontSize,
       onScaleUpdate: (details) {
-        if (details.pointerCount < 2) return; // chỉ áp dụng khi 2 ngón
+        if (details.pointerCount < 2) return;
         setState(() {
-          tab.fontSize = (baseFontSize * details.scale).clamp(8.0, 32.0);
+          tab.fontSize = (tab.pinchBaseFontSize * details.scale).clamp(8.0, 32.0);
         });
       },
       child: TerminalView(
