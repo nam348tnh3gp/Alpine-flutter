@@ -1,4 +1,4 @@
-package com.TNGF.alpinerunner
+package com.TGFN.alpinerunner
 
 import android.content.Context
 
