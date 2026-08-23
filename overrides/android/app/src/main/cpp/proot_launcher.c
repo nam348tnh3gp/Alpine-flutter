@@ -99,7 +99,7 @@ static int add_session(const char *session_id, int master_fd, pid_t child_pid) {
     return 0;
 }
 
-// --- Logging (giữ nguyên, chỉ sửa nhỏ để an toàn UTF-8) ---
+// --- Logging ---
 static void emit_log(LogCtx *ctx, const char *prefix, const char *line, size_t len) {
     if (ctx->callback == NULL || ctx->onLogMid == NULL) {
         LOGD("%s%s%.*s", ctx->session_id ? ctx->session_id : "", prefix, (int)len, line);
@@ -119,11 +119,49 @@ static void emit_log(LogCtx *ctx, const char *prefix, const char *line, size_t l
     (*ctx->env)->DeleteLocalRef(ctx->env, jline);
 }
 
-// ========== CÁC HÀM JNI VỚI TÊN ĐÚNG PACKAGE ==========
-// Package thực tế: com.TGFN.alpinerunner
+// --- Kiểm tra đúng ranh giới UTF-8 ---
+// Trả về số byte ở CUỐI buf là phần đầu của 1 ký tự UTF-8 nhiều-byte CHƯA đủ dữ liệu
+// (cần giữ lại chờ đọc thêm). Trả về 0 nếu buf kết thúc "sạch" (không có ký tự dở dang).
+static size_t incomplete_utf8_tail(const unsigned char *buf, size_t len) {
+    if (len == 0) return 0;
+    size_t max_back = len < 3 ? len : 3; // ký tự UTF-8 dài nhất cần lùi tối đa 3 byte để tìm lead byte
+    for (size_t back = 1; back <= max_back; back++) {
+        unsigned char b = buf[len - back];
+        if ((b & 0xC0) != 0x80) {
+            // b là byte "lead" (hoặc ASCII thường)
+            int need;
+            if ((b & 0x80) == 0x00) need = 1;       // 0xxxxxxx (ASCII)
+            else if ((b & 0xE0) == 0xC0) need = 2;  // 110xxxxx
+            else if ((b & 0xF0) == 0xE0) need = 3;  // 1110xxxx
+            else if ((b & 0xF8) == 0xF0) need = 4;  // 11110xxx
+            else need = 1;                          // byte không hợp lệ, coi như đã "xong"
+            if ((size_t)need > back) {
+                return back; // còn thiếu continuation byte -> giữ lại `back` byte cuối
+            }
+            return 0; // ký tự đã đủ byte, an toàn để gửi hết
+        }
+    }
+    // 3 byte cuối đều là continuation byte, không thấy lead -> ký tự 4-byte dở dang, giữ hết
+    return max_back;
+}
+
+// Gửi phần "an toàn" của utf8_buf ra ngoài, giữ lại phần ký tự dở dang (nếu có) ở đầu buffer
+static void flush_utf8_safe(LogCtx *ctx, char *utf8_buf, size_t *utf8_len) {
+    size_t hold = incomplete_utf8_tail((unsigned char *)utf8_buf, *utf8_len);
+    if (*utf8_len > hold) {
+        emit_log(ctx, "[pty]", utf8_buf, *utf8_len - hold);
+        if (hold > 0) {
+            memmove(utf8_buf, utf8_buf + (*utf8_len - hold), hold);
+        }
+        *utf8_len = hold;
+    }
+}
+
+// ========== CÁC HÀM JNI ==========
+// Package: com.TGFN.alpinerunner
 
 JNIEXPORT jint JNICALL
-Java_com_TGFN_alpinerunner_ProotLauncher_runProot(  // ← sửa package
+Java_com_TGFN_alpinerunner_ProotLauncher_runProot(
     JNIEnv *env,
     jobject thiz,
     jstring prootPath,
@@ -237,7 +275,6 @@ Java_com_TGFN_alpinerunner_ProotLauncher_runProot(  // ← sửa package
         return -1;
     }
 
-    // Đặt kích thước PTY
     if (rows <= 0) rows = 24;
     if (cols <= 0) cols = 80;
     struct winsize sz = {
@@ -250,7 +287,6 @@ Java_com_TGFN_alpinerunner_ProotLauncher_runProot(  // ← sửa package
 
     pid_t pid = fork();
     if (pid == 0) {
-        // Tiến trình con
         close(master_fd);
         setsid();
 
@@ -310,7 +346,6 @@ Java_com_TGFN_alpinerunner_ProotLauncher_runProot(  // ← sửa package
         return -1;
     }
 
-    // Lưu session
     if (add_session(session_id, master_fd, pid) != 0) {
         char msg[128];
         int n = snprintf(msg, sizeof(msg), "[launcher] quá nhiều session");
@@ -324,7 +359,7 @@ Java_com_TGFN_alpinerunner_ProotLauncher_runProot(  // ← sửa package
 
     fcntl(master_fd, F_SETFL, O_NONBLOCK);
 
-    // --- Vòng lặp đọc PTY với bộ đệm UTF-8 an toàn ---
+    // --- Vòng lặp đọc PTY, gộp cả xử lý ranh giới UTF-8 an toàn ---
     int status = 0;
     int childExited = 0;
     int exitCode = -1;
@@ -338,33 +373,22 @@ Java_com_TGFN_alpinerunner_ProotLauncher_runProot(  // ← sửa package
         char chunk[4096];
         ssize_t n;
         while ((n = read(master_fd, chunk, sizeof(chunk))) > 0) {
-            // Nối vào bộ đệm
-            if (utf8_len + n < sizeof(utf8_buf)) {
-                memcpy(utf8_buf + utf8_len, chunk, n);
-                utf8_len += n;
-            } else {
-                // Tràn bộ đệm – gửi những gì có thể (không xảy ra trong thực tế)
-                emit_log(&ctx, "[pty]", utf8_buf, utf8_len);
-                utf8_len = 0;
-                memcpy(utf8_buf, chunk, n);
-                utf8_len = n;
-            }
-            // Kiểm tra xem có ký tự UTF-8 hợp lệ hoàn chỉnh ở cuối không
-            // Cách đơn giản: tìm vị trí ký tự không hợp lệ bằng cách kiểm tra byte đầu
-            // Ở đây, để đơn giản, ta chỉ gửi toàn bộ nếu kết thúc bằng newline hoặc NULL
-            // Thực tế, ta có thể gửi ngay sau mỗi lần đọc nhưng phải xử lý cắt giữa chừng:
-            // Bằng cách không chia nhỏ nếu byte cuối là byte tiếp tục UTF-8.
-            // Tôi dùng cách: lùi lại cho đến khi byte cuối không phải là 0x80-0xBF
-            // Nếu tất cả đều là tiếp tục, đợi lần đọc sau.
-            if (utf8_len > 0) {
-                unsigned char last = utf8_buf[utf8_len - 1];
-                if ((last & 0xC0) != 0x80) { // không phải byte tiếp tục
-                    // Gửi toàn bộ
+            size_t off = 0;
+            while (off < (size_t)n) {
+                size_t space = sizeof(utf8_buf) - utf8_len;
+                size_t take = (size_t)n - off < space ? (size_t)n - off : space;
+                memcpy(utf8_buf + utf8_len, chunk + off, take);
+                utf8_len += take;
+                off += take;
+                if (utf8_len == sizeof(utf8_buf)) {
+                    // Buffer đầy, buộc phải gửi (kể cả nếu đang giữa 1 ký tự dở dang,
+                    // trường hợp cực hiếm, không có cách nào khác vì hết chỗ chứa)
                     emit_log(&ctx, "[pty]", utf8_buf, utf8_len);
                     utf8_len = 0;
                 }
-                // Nếu là byte tiếp tục, giữ lại chờ thêm dữ liệu
             }
+            // Gửi phần dữ liệu "an toàn" (không cắt giữa ký tự UTF-8), giữ lại phần dở dang
+            flush_utf8_safe(&ctx, utf8_buf, &utf8_len);
         }
         if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
             char msg[128];
@@ -377,25 +401,38 @@ Java_com_TGFN_alpinerunner_ProotLauncher_runProot(  // ← sửa package
             childExited = 1;
         } else if (r < 0 && errno != EINTR) {
             char msg[128];
-            int n = snprintf(msg, sizeof(msg), "[launcher] waitpid lỗi: %s", strerror(errno));
-            emit_log(&ctx, "[launcher]", msg, (size_t)n);
+            int n2 = snprintf(msg, sizeof(msg), "[launcher] waitpid lỗi: %s", strerror(errno));
+            emit_log(&ctx, "[launcher]", msg, (size_t)n2);
             break;
         }
     }
 
-    // Đọc nốt dữ liệu còn lại
-    char chunk[4096];
-    ssize_t n;
-    while ((n = read(master_fd, chunk, sizeof(chunk))) > 0) {
-        // Gửi trực tiếp (không quan trọng UTF-8 vì đã kết thúc)
-        emit_log(&ctx, "[pty]", chunk, (size_t)n);
+    // Đọc nốt dữ liệu còn lại — dùng CHUNG bộ đệm UTF-8 để không đảo thứ tự byte
+    {
+        char chunk[4096];
+        ssize_t n;
+        while ((n = read(master_fd, chunk, sizeof(chunk))) > 0) {
+            size_t off = 0;
+            while (off < (size_t)n) {
+                size_t space = sizeof(utf8_buf) - utf8_len;
+                size_t take = (size_t)n - off < space ? (size_t)n - off : space;
+                memcpy(utf8_buf + utf8_len, chunk + off, take);
+                utf8_len += take;
+                off += take;
+                if (utf8_len == sizeof(utf8_buf)) {
+                    emit_log(&ctx, "[pty]", utf8_buf, utf8_len);
+                    utf8_len = 0;
+                }
+            }
+        }
     }
+    // Đây là dữ liệu cuối cùng, không còn gì đọc thêm nữa -> gửi hết, kể cả phần dở dang
     if (utf8_len > 0) {
         emit_log(&ctx, "[pty]", utf8_buf, utf8_len);
+        utf8_len = 0;
     }
 
     // Đóng và giải phóng session
-    // Tìm session, giảm ref
     Session *s = NULL;
     pthread_mutex_lock(&g_session_mutex);
     for (int i = 0; i < g_session_count; i++) {
@@ -412,7 +449,6 @@ Java_com_TGFN_alpinerunner_ProotLauncher_runProot(  // ← sửa package
         if (should_close) {
             close(s->master_fd);
             s->master_fd = -1;
-            // Xóa khỏi danh sách
             for (int i = 0; i < g_session_count; i++) {
                 if (strcmp(g_sessions[i].session_id, session_id) == 0) {
                     for (int j = i; j < g_session_count - 1; j++) {
@@ -439,8 +475,7 @@ Java_com_TGFN_alpinerunner_ProotLauncher_runProot(  // ← sửa package
         exitCode = 128 + WTERMSIG(status);
     }
 
-    // Giải phóng bộ nhớ đúng cách
-    (*env)->ReleaseStringUTFChars(env, prootPath, proot);  // ← sửa
+    (*env)->ReleaseStringUTFChars(env, prootPath, proot);
     for (int i = 0; i < argc + 1; i++) free(argv[i]);
     free(argv);
     for (int i = 0; i < envc; i++) free(envp[i]);
@@ -451,9 +486,8 @@ Java_com_TGFN_alpinerunner_ProotLauncher_runProot(  // ← sửa package
     return exitCode;
 }
 
-// Các hàm JNI còn lại với tên đúng package
 JNIEXPORT jint JNICALL
-Java_com_TGFN_alpinerunner_ProotLauncher_writeToPty(  // ← sửa
+Java_com_TGFN_alpinerunner_ProotLauncher_writeToPty(
     JNIEnv *env,
     jobject thiz,
     jbyteArray data,
@@ -476,18 +510,33 @@ Java_com_TGFN_alpinerunner_ProotLauncher_writeToPty(  // ← sửa
         (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
         return -1;
     }
-    ssize_t written = write(master_fd, bytes, len);
-    if (written < 0) {
-        LOGE("writeToPty: write thất bại: %s", strerror(errno));
+
+    // Ghi lặp lại cho tới khi gửi hết toàn bộ dữ liệu — tránh short-write làm mất/cắt dữ liệu
+    // (đây chính là bug gây "dán text bị dính dòng" đã được sửa ở đây)
+    ssize_t total_written = 0;
+    while (total_written < len) {
+        ssize_t written = write(master_fd, bytes + total_written, (size_t)(len - total_written));
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(2000); // PTY buffer đầy tạm thời, đợi rồi thử lại thay vì bỏ cuộc
+                continue;
+            }
+            LOGE("writeToPty: write thất bại: %s", strerror(errno));
+            break;
+        }
+        if (written == 0) break;
+        total_written += written;
     }
+
     (*env)->ReleaseByteArrayElements(env, data, bytes, JNI_ABORT);
     release_session(s);
     (*env)->ReleaseStringUTFChars(env, sessionId, session_id);
-    return (jint)written;
+    return (jint)total_written;
 }
 
 JNIEXPORT void JNICALL
-Java_com_TGFN_alpinerunner_ProotLauncher_killProot(  // ← sửa
+Java_com_TGFN_alpinerunner_ProotLauncher_killProot(
     JNIEnv *env,
     jobject thiz,
     jstring sessionId) {
@@ -510,7 +559,7 @@ Java_com_TGFN_alpinerunner_ProotLauncher_killProot(  // ← sửa
 }
 
 JNIEXPORT void JNICALL
-Java_com_TGFN_alpinerunner_ProotLauncher_resizePty(  // ← sửa
+Java_com_TGFN_alpinerunner_ProotLauncher_resizePty(
     JNIEnv *env,
     jobject thiz,
     jint width,
