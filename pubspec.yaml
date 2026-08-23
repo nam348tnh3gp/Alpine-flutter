@@ -1,7 +1,7 @@
 name: alpine_runner
 description: Chạy Alpine Linux trên Android qua proot (CLI + GUI/VNC), không cần root.
 publish_to: 'none'
-version: 1.0.0+3
+version: 1.0.0+4
 
 environment:
   sdk: '>=3.4.0 <4.0.0'
