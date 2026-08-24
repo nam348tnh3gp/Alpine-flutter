@@ -28,10 +28,10 @@ class TerminalTab {
 
   TerminalTab({VoidCallback? onProcessExited}) {
     terminal = Terminal(maxLines: 5000);
-    
-    // 🔧 SỬA 1: BẬT BRACKETED PASTE
-    terminal.setBracketedPasteMode(true);
-    
+
+    // Không ép bật bracketed paste. Để xterm tự bật khi shell hỗ trợ (nhận escape sequence).
+    // Nếu ép true, BusyBox ash sẽ nhận các byte escape và làm hỏng dòng paste.
+
     controller = TerminalController();
     focusNode = FocusNode();
     proot = PRootService(
@@ -418,7 +418,6 @@ class _HomeScreenState extends State<HomeScreen> {
                   Navigator.pop(context);
                 },
               ),
-              // 🔧 SỬA 2: CHUẨN HÓA TEXT TRƯỚC KHI PASTE
               ListTile(
                 leading: const Icon(Icons.paste),
                 title: const Text('Paste'),
@@ -429,7 +428,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     String cleanText = rawText
                         .replaceAll('\r\n', '\n')  // Windows -> Unix
                         .replaceAll('\r', '');     // Loại bỏ CR thừa
-                    
+
                     tab.terminal.paste(cleanText);
                     _showSnackBar('📥 Đã paste (đã chuẩn hóa)');
                   }
