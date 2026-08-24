@@ -2,3 +2,5 @@ build/
 .dart_tool/
 .pub/
 *.lock
+upload-keystore.jks
+keystore-base64.txt
