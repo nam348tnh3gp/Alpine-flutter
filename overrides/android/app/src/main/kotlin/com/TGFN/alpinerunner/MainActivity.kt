@@ -7,6 +7,8 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
@@ -17,7 +19,21 @@ class MainActivity : FlutterActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     // Dùng cached thread pool để hỗ trợ nhiều phiên chạy song song
     private val prootExecutor = Executors.newCachedThreadPool()
-    private val ptyExecutor = Executors.newCachedThreadPool()
+
+    // Mỗi session có ĐÚNG 1 luồng ghi PTY riêng, xử lý tuần tự theo thứ tự gửi
+    // (giống cơ chế hàng đợi + 1 consumer thread của Termux) — tránh việc paste/gõ
+    // nhanh bị đảo thứ tự dòng khi nhiều lệnh ghi chạy song song trên cùng 1 session.
+    private val ptyWriters = ConcurrentHashMap<String, ExecutorService>()
+
+    private fun writerFor(sessionId: String): ExecutorService {
+        return ptyWriters.computeIfAbsent(sessionId) {
+            Executors.newSingleThreadExecutor()
+        }
+    }
+
+    private fun closeWriterFor(sessionId: String) {
+        ptyWriters.remove(sessionId)?.shutdown()
+    }
 
     private var logSink: EventChannel.EventSink? = null
 
@@ -76,6 +92,8 @@ class MainActivity : FlutterActivity() {
                                 mainHandler.post {
                                     result.error("JNI_ERROR", e.message, e.stackTraceToString())
                                 }
+                            } finally {
+                                closeWriterFor(sessionId) // tiến trình đã thoát -> dọn luồng ghi riêng
                             }
                         }
                     }
@@ -86,14 +104,15 @@ class MainActivity : FlutterActivity() {
                             result.error("BAD_ARGS", "Missing data", null)
                             return@setMethodCallHandler
                         }
-                        ptyExecutor.execute {
+                        // Đẩy vào đúng luồng ghi riêng của session này -> giữ nguyên thứ tự
+                        writerFor(sessionId).execute {
                             val written = ProotLauncher.writeToPty(data, sessionId)
                             mainHandler.post { result.success(written) }
                         }
                     }
                     "killProot" -> {
                         val sessionId = call.argument<String>("sessionId") ?: "default"
-                        ptyExecutor.execute {
+                        writerFor(sessionId).execute {
                             ProotLauncher.killProot(sessionId)
                             mainHandler.post { result.success(null) }
                         }
@@ -102,7 +121,7 @@ class MainActivity : FlutterActivity() {
                         val width = call.argument<Int>("width") ?: 80
                         val height = call.argument<Int>("height") ?: 24
                         val sessionId = call.argument<String>("sessionId") ?: "default"
-                        ptyExecutor.execute {
+                        writerFor(sessionId).execute {
                             ProotLauncher.resizePty(width, height, sessionId)
                             mainHandler.post { result.success(null) }
                         }
