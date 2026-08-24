@@ -28,6 +28,10 @@ class TerminalTab {
 
   TerminalTab({VoidCallback? onProcessExited}) {
     terminal = Terminal(maxLines: 5000);
+    
+    // 🔧 SỬA 1: BẬT BRACKETED PASTE
+    terminal.setBracketedPasteMode(true);
+    
     controller = TerminalController();
     focusNode = FocusNode();
     proot = PRootService(
@@ -414,14 +418,20 @@ class _HomeScreenState extends State<HomeScreen> {
                   Navigator.pop(context);
                 },
               ),
+              // 🔧 SỬA 2: CHUẨN HÓA TEXT TRƯỚC KHI PASTE
               ListTile(
                 leading: const Icon(Icons.paste),
                 title: const Text('Paste'),
                 enabled: hasClipboard,
                 onTap: () {
                   if (hasClipboard) {
-                    tab.terminal.paste(clipboardData!.text!);
-                    _showSnackBar('📥 Đã paste');
+                    String rawText = clipboardData!.text!;
+                    String cleanText = rawText
+                        .replaceAll('\r\n', '\n')  // Windows -> Unix
+                        .replaceAll('\r', '');     // Loại bỏ CR thừa
+                    
+                    tab.terminal.paste(cleanText);
+                    _showSnackBar('📥 Đã paste (đã chuẩn hóa)');
                   }
                   Navigator.pop(context);
                 },
