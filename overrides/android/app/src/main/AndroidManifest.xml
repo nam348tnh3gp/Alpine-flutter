@@ -34,13 +34,4 @@
             android:value="2" />
     </application>
 
-    <!-- Cho phép app gọi package RealVNC Viewer qua scheme vnc:// -->
-    <queries>
-        <package android:name="com.realvnc.viewer.android" />
-        <intent>
-            <action android:name="android.intent.action.VIEW" />
-            <data android:scheme="vnc" />
-        </intent>
-    </queries>
-
 </manifest>
