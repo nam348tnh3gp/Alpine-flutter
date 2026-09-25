@@ -1,5 +1,5 @@
 name: alpine_runner
-description: Chạy Alpine Linux trên Android qua proot (CLI + GUI/VNC), không cần root.
+description: Chạy Alpine Linux trên Android qua proot (CLI), không cần root.
 publish_to: 'none'
 version: 1.0.0+7
 
@@ -15,7 +15,6 @@ dependencies:
   # Sử dụng xterm 4.0.0 (tương thích với Flutter 3.22)
   # không cần ghim phiên bản cũ vì đã dùng onOutput thay vì onInput
   xterm: ^4.0.0
-  url_launcher: ^6.3.0
   http: ^1.2.1
   tar: ^2.0.1
 
@@ -26,5 +25,3 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
-  assets:
-    - assets/rootfs-scripts/start-gui.sh
