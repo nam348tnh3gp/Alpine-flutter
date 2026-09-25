@@ -125,14 +125,6 @@ jobs:
             build_workspace/android/settings.gradle
           grep "org.jetbrains.kotlin.android" build_workspace/android/settings.gradle
 
-      - name: Copy start-gui.sh to assets
-        run: |
-          mkdir -p build_workspace/assets/rootfs-scripts
-          cp overrides/rootfs-scripts/start-gui.sh build_workspace/assets/rootfs-scripts/start-gui.sh
-          if ! grep -q "assets/rootfs-scripts/" build_workspace/pubspec.yaml; then
-            python3 scripts/patch_pubspec_assets.py build_workspace/pubspec.yaml
-          fi
-
       - name: Fetch native binaries
         working-directory: build_workspace
         run: |
