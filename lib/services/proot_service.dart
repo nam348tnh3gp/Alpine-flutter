@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'package:flutter/services.dart';
 import 'package:tar/tar.dart';
 import 'package:http/http.dart' as http;
 import 'native_bridge.dart';
@@ -182,18 +181,6 @@ class PRootService {
     if (chmodResult.exitCode != 0) {
       _log('⚠️ chmod -R a+rX $rootfs thất bại (exit ${chmodResult.exitCode}): '
           '${chmodResult.stderr}');
-    }
-
-    final scriptAsset = 'assets/rootfs-scripts/start-gui.sh';
-    final scriptDest = '$rootfs/usr/local/bin/start-gui.sh';
-    try {
-      final scriptContent = await rootBundle.loadString(scriptAsset);
-      await File(scriptDest).create(recursive: true);
-      await File(scriptDest).writeAsString(scriptContent);
-      await Process.run('chmod', ['+x', scriptDest]);
-      _log('✅ Đã copy start-gui.sh vào $scriptDest');
-    } catch (e) {
-      _log('⚠️ Không copy được start-gui.sh: $e');
     }
 
     final shLink = Link('$rootfs/bin/sh');
