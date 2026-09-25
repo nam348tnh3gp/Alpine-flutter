@@ -1,11 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/gestures.dart';
-import 'package:url_launcher/url_launcher.dart';
 import 'package:xterm/xterm.dart';
 import '../services/proot_service.dart';
-
-enum RunMode { cli, gui }
 
 /// Đối tượng đại diện cho một phiên terminal (tab)
 class TerminalTab {
@@ -16,7 +13,6 @@ class TerminalTab {
 
   bool running = false;
   bool stopping = false;
-  RunMode? mode;
 
   // Toggle modifier keys cho phiên này
   bool ctrlActive = false;
@@ -160,7 +156,6 @@ class _HomeScreenState extends State<HomeScreen> {
         if (mounted) {
           setState(() {
             tab.running = false;
-            tab.mode = null;
             tab.stopping = false;
           });
         }
@@ -194,7 +189,6 @@ class _HomeScreenState extends State<HomeScreen> {
     if (tab.running || tab.stopping) return;
     setState(() {
       tab.running = true;
-      tab.mode = RunMode.cli;
     });
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -219,58 +213,8 @@ class _HomeScreenState extends State<HomeScreen> {
       if (mounted) {
         setState(() {
           tab.running = false;
-          tab.mode = null;
         });
       }
-    }
-  }
-
-  Future<void> _launchGuiForTab(TerminalTab tab) async {
-    if (tab.running || tab.stopping) return;
-    setState(() {
-      tab.running = true;
-      tab.mode = RunMode.gui;
-    });
-
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) FocusScope.of(context).requestFocus(tab.focusNode);
-    });
-
-    await Future.delayed(const Duration(milliseconds: 50));
-
-    final rows = tab.terminal.viewHeight > 0 ? tab.terminal.viewHeight : 24;
-    final cols = tab.terminal.viewWidth > 0 ? tab.terminal.viewWidth : 80;
-
-    try {
-      final processFuture = tab.proot.start(
-        command: ['/bin/sh', '/usr/local/bin/start-gui.sh'],
-        onStdout: (s) => tab.terminal.write(_sanitizeTerminalOutput(s)),
-        rows: rows,
-        cols: cols,
-      );
-      await Future.delayed(const Duration(seconds: 2));
-      await _openRealVnc();
-      await processFuture;
-    } catch (e) {
-      tab.terminal.write('❌ LỖI khởi chạy GUI: $e\r\n');
-      _showErrorSnackBar('Lỗi khởi chạy GUI: $e');
-      if (mounted) {
-        setState(() {
-          tab.running = false;
-          tab.mode = null;
-        });
-      }
-    }
-  }
-
-  Future<void> _openRealVnc() async {
-    final uri = Uri.parse('vnc://127.0.0.1:5900');
-    if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
-      final tab = _tabs.isNotEmpty ? _tabs[_currentTabIndex!] : null;
-      tab?.terminal.write(
-          '\r\n📱 Không mở được RealVNC Viewer. Hãy cài app "RealVNC Viewer" '
-          'từ Play Store rồi kết nối thủ công tới 127.0.0.1:5900\r\n');
-      _showSnackBar('Không mở được RealVNC Viewer. Vui lòng kết nối thủ công.');
     }
   }
 
@@ -293,7 +237,6 @@ class _HomeScreenState extends State<HomeScreen> {
         setState(() {
           tab.stopping = false;
           tab.running = false;
-          tab.mode = null;
         });
       }
     });
@@ -464,6 +407,12 @@ class _HomeScreenState extends State<HomeScreen> {
           tooltip: 'Menu',
         ),
         actions: [
+          if (_installed)
+            IconButton(
+              icon: const Icon(Icons.add),
+              onPressed: _newSession,
+              tooltip: 'Phiên mới',
+            ),
           if (_currentTabIndex != null && _tabs.isNotEmpty)
             IconButton(
               icon: const Icon(Icons.stop),
@@ -476,7 +425,7 @@ class _HomeScreenState extends State<HomeScreen> {
         children: [
           if (!_installed) _buildInstallPanel(),
           if (_installed && (_tabs.isEmpty || _currentTabIndex == null))
-            _buildModePicker(),
+            _buildBootingIndicator(),
           if (_tabs.isNotEmpty) _buildTabBar(),
           Expanded(
             child: _tabs.isEmpty
@@ -670,33 +619,22 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildModePicker() {
-    return Padding(
-      padding: const EdgeInsets.all(16),
+  /// Hiện trong khoảnh khắc ngắn giữa lúc xác nhận đã cài Alpine và lúc
+  /// phiên CLI đầu tiên thực sự sẵn sàng (auto-boot) - trước đây khoảng
+  /// trống này để trống/nhấp nháy màn hình chọn mode, giờ thay bằng loading
+  /// rõ ràng để người dùng biết app đang tự khởi động, không phải bị treo.
+  Widget _buildBootingIndicator() {
+    return const Padding(
+      padding: EdgeInsets.all(24),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Card(
-            child: ListTile(
-              leading: const Icon(Icons.terminal),
-              title: const Text('CLI'),
-              subtitle: const Text('Mở shell Alpine trong terminal'),
-              onTap: _newSession,
-            ),
+          SizedBox(
+            width: 28, height: 28,
+            child: CircularProgressIndicator(strokeWidth: 2.5),
           ),
-          const SizedBox(height: 8),
-          Card(
-            child: ListTile(
-              leading: const Icon(Icons.desktop_windows),
-              title: const Text('GUI (VNC)'),
-              subtitle:
-                  const Text('Khởi động môi trường đồ họa và kết nối qua RealVNC'),
-              onTap: () async {
-                final tab = await _createNewTab();
-                await _launchGuiForTab(tab);
-              },
-            ),
-          ),
+          SizedBox(height: 12),
+          Text('🚀 Đang khởi động Alpine...'),
         ],
       ),
     );
