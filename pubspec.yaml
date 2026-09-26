@@ -17,6 +17,7 @@ dependencies:
   xterm: ^4.0.0
   http: ^1.2.1
   tar: ^2.0.1
+  archive: ^3.6.1
 
 dev_dependencies:
   flutter_test:
