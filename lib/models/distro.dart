@@ -85,15 +85,16 @@ class Distros {
   static const gentoo = Distro(
     id: 'gentoo',
     displayName: 'Gentoo',
-    description: 'Stage3 OpenRC (~200-300MB, giải nén nặng hơn nhiều). Chỉ '
-        'hỗ trợ arm64-v8a. Cần RAM rộng rãi lúc cài vì phải giải nén .tar.xz '
-        'trong bộ nhớ.',
+    description: 'Stage3 OpenRC (~200-300MB, giải nén nặng hơn nhiều). Cần '
+        'RAM rộng rãi lúc cài vì phải giải nén .tar.xz trong bộ nhớ.',
     archUrls: {},
     isXz: true,
     markerFile: 'etc/gentoo-release',
     latestTxtUrls: {
       'arm64-v8a':
           'https://distfiles.gentoo.org/releases/arm64/autobuilds/current-stage3-arm64-openrc/latest-stage3-arm64-openrc.txt',
+      'armeabi-v7a':
+          'https://distfiles.gentoo.org/releases/arm/autobuilds/current-stage3-armv7a-openrc/latest-stage3-armv7a-openrc.txt',
     },
     postInstallNote:
         '⚠️ Gentoo mới cài chỉ có stage3 gốc, CHƯA có portage tree (danh '
