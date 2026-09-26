@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/gestures.dart';
 import 'package:xterm/xterm.dart';
 import '../services/proot_service.dart';
+import '../models/distro.dart';
 
 /// Đối tượng đại diện cho một phiên terminal (tab)
 class TerminalTab {
@@ -10,6 +11,7 @@ class TerminalTab {
   late final TerminalController controller;
   late final FocusNode focusNode;
   late final PRootService proot;
+  final Distro distro;
 
   bool running = false;
   bool stopping = false;
@@ -22,7 +24,7 @@ class TerminalTab {
   double fontSize = 14.0;
   double pinchBaseFontSize = 14.0; // chỉ set 1 lần khi bắt đầu pinch
 
-  TerminalTab({VoidCallback? onProcessExited}) {
+  TerminalTab({required this.distro, VoidCallback? onProcessExited}) {
     terminal = Terminal(maxLines: 5000);
 
     // Không ép bật bracketed paste. Để xterm tự bật khi shell hỗ trợ (nhận escape sequence).
@@ -31,6 +33,7 @@ class TerminalTab {
     controller = TerminalController();
     focusNode = FocusNode();
     proot = PRootService(
+      distro: distro,
       onLog: (l) => terminal.write('$l\r\n'),
       onProcessExited: onProcessExited,
     );
@@ -54,9 +57,14 @@ class _HomeScreenState extends State<HomeScreen> {
   final List<TerminalTab> _tabs = [];
   int? _currentTabIndex;
 
-  bool _installed = false;
+  // Trạng thái cài đặt của TỪNG distro (id -> đã cài xong hay chưa).
+  final Map<String, bool> _installedMap = {};
+  bool _checkingInstalled = true;
   bool _installing = false;
   double _progress = 0;
+  Distro? _installingDistro;
+
+  bool get _anyInstalled => _installedMap.values.any((v) => v);
 
   @override
   void initState() {
@@ -75,38 +83,59 @@ class _HomeScreenState extends State<HomeScreen> {
   // ==================== Kiểm tra & cài đặt rootfs ====================
 
   Future<void> _checkInstalled() async {
-    final tempService = PRootService(onLog: (_) {});
-    final ok = await tempService.isInstalled();
-    if (mounted) {
-      setState(() => _installed = ok);
-      if (_installed && _tabs.isEmpty) {
-        // Tự động tạo phiên CLI đầu tiên
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          _newSession();
-        });
-      }
+    final results = <String, bool>{};
+    for (final d in Distros.all) {
+      final tempService = PRootService(distro: d, onLog: (_) {});
+      results[d.id] = await tempService.isInstalled();
+    }
+    if (!mounted) return;
+    setState(() {
+      _installedMap
+        ..clear()
+        ..addAll(results);
+      _checkingInstalled = false;
+    });
+    if (_anyInstalled && _tabs.isEmpty) {
+      // Tự động tạo phiên CLI đầu tiên cho distro đã cài (ưu tiên theo thứ
+      // tự Distros.all - nếu chỉ cài 1 distro thì luôn tự boot đúng distro đó).
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _newSession();
+      });
     }
   }
 
   // ========== BẢN VÁ: Sửa lỗi kẹt UI sau cài đặt ==========
-  Future<void> _ensureInstalled() async {
-    if (_installed) return;
-    setState(() => _installing = true);
+  Future<void> _ensureInstalled(Distro distro, {StateSetter? sheetSetState}) async {
+    if (_installedMap[distro.id] == true) return;
+
+    // Cập nhật CẢ state chính lẫn state của bottom sheet "Quản lý Distro"
+    // (nếu đang mở từ đó) - setState() của widget chính không tự kéo theo
+    // rebuild của 1 modal đang mở, nên phải gọi thêm sheetSetState riêng.
+    void update(VoidCallback fn) {
+      if (mounted) setState(fn);
+      sheetSetState?.call(fn);
+    }
+
+    update(() {
+      _installing = true;
+      _installingDistro = distro;
+    });
 
     // Tạo một tab tạm để hiển thị log trong quá trình cài
-    final tempTab = TerminalTab();
+    final tempTab = TerminalTab(distro: distro);
     setState(() {
       _tabs.add(tempTab);
       _currentTabIndex = _tabs.length - 1;
     });
 
     final service = PRootService(
+      distro: distro,
       onLog: (l) => tempTab.terminal.write('$l\r\n'),
     );
 
     try {
       await service.bootstrap(onProgress: (p) {
-        if (mounted) setState(() => _progress = p);
+        update(() => _progress = p);
       });
 
       if (mounted) {
@@ -119,13 +148,14 @@ class _HomeScreenState extends State<HomeScreen> {
           _currentTabIndex = 0;
         }
 
-        setState(() {
-          _installed = true;
+        update(() {
+          _installedMap[distro.id] = true;
           _installing = false;
+          _installingDistro = null;
         });
 
-        // Tạo một phiên thật đầu tiên
-        await _newSession();
+        // Tạo một phiên thật đầu tiên cho distro vừa cài
+        await _newSession(distro: distro);
       }
     } catch (e) {
       if (mounted) {
@@ -134,7 +164,10 @@ class _HomeScreenState extends State<HomeScreen> {
         // Xóa tab tạm và reset trạng thái
         _tabs.remove(tempTab);
         if (_tabs.isEmpty) _currentTabIndex = null;
-        setState(() => _installing = false);
+        update(() {
+          _installing = false;
+          _installingDistro = null;
+        });
       }
     } finally {
       service.stop();
@@ -149,9 +182,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // ==================== Quản lý tab & phiên ====================
 
-  Future<TerminalTab> _createNewTab() async {
+  Future<TerminalTab> _createNewTab(Distro distro) async {
     late final TerminalTab tab;
     tab = TerminalTab(
+      distro: distro,
       onProcessExited: () {
         if (mounted) {
           setState(() {
@@ -218,9 +252,53 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> _newSession() async {
-    final tab = await _createNewTab();
+  /// Tạo phiên mới. Nếu không truyền [distro]:
+  /// - Chỉ 1 distro đã cài -> dùng luôn distro đó (giữ trải nghiệm "auto-boot"
+  ///   không cần chọn gì, giống hệt hành vi cũ khi app chỉ có Alpine).
+  /// - Nhiều distro đã cài -> hỏi nhanh muốn mở distro nào.
+  /// - Chưa cài distro nào -> chuyển sang màn hình cài đặt thay vì tạo phiên.
+  Future<void> _newSession({Distro? distro}) async {
+    distro ??= await _resolveDistroForNewSession();
+    if (distro == null) return; // chưa cài gì / người dùng huỷ chọn
+
+    final tab = await _createNewTab(distro);
     await _launchCliForTab(tab);
+  }
+
+  Future<Distro?> _resolveDistroForNewSession() async {
+    final installed =
+        Distros.all.where((d) => _installedMap[d.id] == true).toList();
+    if (installed.isEmpty) {
+      setState(() {}); // đảm bảo _buildDistroPicker() hiện lên
+      _showSnackBar('Chưa cài distro nào - chọn 1 distro bên dưới để cài.');
+      return null;
+    }
+    if (installed.length == 1) return installed.first;
+    return _pickInstalledDistro(installed);
+  }
+
+  Future<Distro?> _pickInstalledDistro(List<Distro> installed) async {
+    if (!mounted) return null;
+    return showModalBottomSheet<Distro>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.all(12),
+              child: Text('Mở phiên mới với distro nào?',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+            ),
+            ...installed.map((d) => ListTile(
+                  leading: const Icon(Icons.terminal),
+                  title: Text(d.displayName),
+                  onTap: () => Navigator.pop(context, d),
+                )),
+          ],
+        ),
+      ),
+    );
   }
 
   void _stopCurrentTab() {
@@ -330,6 +408,33 @@ class _HomeScreenState extends State<HomeScreen> {
     return processed;
   }
 
+  Future<void> _showDistroManager() async {
+    if (!mounted) return;
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setSheetState) => SafeArea(
+          child: SingleChildScrollView(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text('🐧 Quản lý Distro',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                  const SizedBox(height: 12),
+                  ...Distros.all.map((d) => _buildDistroCard(d, sheetSetState: setSheetState)),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   // ==================== Menu ngữ cảnh terminal (copy/paste) ====================
 
   Future<void> _showTerminalContextMenu(TerminalTab tab) async {
@@ -407,10 +512,10 @@ class _HomeScreenState extends State<HomeScreen> {
           tooltip: 'Menu',
         ),
         actions: [
-          if (_installed)
+          if (_anyInstalled)
             IconButton(
               icon: const Icon(Icons.add),
-              onPressed: _newSession,
+              onPressed: () => _newSession(),
               tooltip: 'Phiên mới',
             ),
           if (_currentTabIndex != null && _tabs.isNotEmpty)
@@ -423,8 +528,19 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
       body: Column(
         children: [
-          if (!_installed) _buildInstallPanel(),
-          if (_installed && (_tabs.isEmpty || _currentTabIndex == null))
+          if (_checkingInstalled)
+            const Padding(
+              padding: EdgeInsets.all(24),
+              child: Center(
+                child: SizedBox(
+                  width: 24, height: 24,
+                  child: CircularProgressIndicator(strokeWidth: 2.5),
+                ),
+              ),
+            )
+          else if (!_anyInstalled)
+            _buildDistroPicker()
+          else if (_tabs.isEmpty || _currentTabIndex == null)
             _buildBootingIndicator(),
           if (_tabs.isNotEmpty) _buildTabBar(),
           Expanded(
@@ -482,6 +598,15 @@ class _HomeScreenState extends State<HomeScreen> {
                 onTap: () {
                   Navigator.pop(context);
                   _newSession();
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.widgets_outlined),
+                title: const Text('Quản lý Distro'),
+                subtitle: const Text('Cài thêm / xem distro đã cài'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showDistroManager();
                 },
               ),
               ListTile(
@@ -548,7 +673,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: Row(
                   children: [
                     Text(
-                      'Term ${index + 1}',
+                      '${tab.distro.displayName} ${index + 1}',
                       style: const TextStyle(color: Colors.white, fontSize: 12),
                     ),
                     if (isSelected)
@@ -596,25 +721,68 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildInstallPanel() {
+  Widget _buildDistroPicker() {
     return Padding(
       padding: const EdgeInsets.all(16),
       child: Column(
         mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const Text('📥 Chưa cài Alpine rootfs.'),
+          const Text('🐧 Chọn distro để cài', style: TextStyle(fontWeight: FontWeight.bold)),
           const SizedBox(height: 12),
-          if (_installing) ...[
-            LinearProgressIndicator(value: _progress > 0 ? _progress : null),
-            const SizedBox(height: 8),
-            Text('${(_progress * 100).toStringAsFixed(0)}%'),
-          ] else
-            FilledButton.icon(
-              onPressed: _ensureInstalled,
-              icon: const Icon(Icons.download),
-              label: const Text('Tải & cài Alpine ngay bây giờ'),
-            ),
+          ...Distros.all.map((d) => _buildDistroCard(d)),
         ],
+      ),
+    );
+  }
+
+  Widget _buildDistroCard(Distro d, {StateSetter? sheetSetState}) {
+    final installed = _installedMap[d.id] == true;
+    final isInstallingThis = _installing && _installingDistro?.id == d.id;
+    final inSheet = sheetSetState != null;
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 8),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(installed ? Icons.check_circle : Icons.terminal,
+                    color: installed ? Colors.teal : null),
+                const SizedBox(width: 8),
+                Text(d.displayName,
+                    style: const TextStyle(fontWeight: FontWeight.bold)),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text(d.description, style: const TextStyle(fontSize: 12)),
+            const SizedBox(height: 10),
+            if (isInstallingThis) ...[
+              LinearProgressIndicator(value: _progress > 0 ? _progress : null),
+              const SizedBox(height: 6),
+              Text('${(_progress * 100).toStringAsFixed(0)}%'),
+            ] else if (installed)
+              OutlinedButton.icon(
+                onPressed: () {
+                  if (inSheet) Navigator.pop(context);
+                  _newSession(distro: d);
+                },
+                icon: const Icon(Icons.play_arrow),
+                label: const Text('Mở phiên'),
+              )
+            else
+              FilledButton.icon(
+                onPressed: _installing
+                    ? null
+                    : () => _ensureInstalled(d, sheetSetState: sheetSetState),
+                icon: const Icon(Icons.download),
+                label: const Text('Tải & cài'),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -634,7 +802,7 @@ class _HomeScreenState extends State<HomeScreen> {
             child: CircularProgressIndicator(strokeWidth: 2.5),
           ),
           SizedBox(height: 12),
-          Text('🚀 Đang khởi động Alpine...'),
+          Text('🚀 Đang khởi động...'),
         ],
       ),
     );
