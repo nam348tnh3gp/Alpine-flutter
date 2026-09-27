@@ -8,7 +8,8 @@ class Distro {
   final String description;
 
   /// abi ('arm64-v8a' | 'armeabi-v7a') -> URL tải tarball trực tiếp.
-  /// Rỗng nếu distro cần resolve URL động (xem [gentooAutobuilds]).
+  /// Rỗng nếu distro cần resolve URL động (xem [gentooAutobuilds],
+  /// [alpineLatest]).
   final Map<String, String> archUrls;
 
   /// true nếu tarball nén .tar.xz (cần XZDecoder), false = .tar.gz (gzip).
@@ -27,6 +28,11 @@ class Distro {
   /// file thay vì phụ thuộc bất kỳ con trỏ "latest" nào của Gentoo.
   final Map<String, GentooAutobuild>? gentooAutobuilds;
 
+  /// Alpine cũng xoá dần các bản minirootfs point-release cũ khỏi mirror
+  /// (vd URL trỏ cứng tới 3.19.9 sẽ 404 khi 3.19.9 bị bỏ). Vì vậy ta
+  /// resolve URL động qua `latest-releases.yaml` của branch stable.
+  final Map<String, AlpineLatest>? alpineLatest;
+
   const Distro({
     required this.id,
     required this.displayName,
@@ -36,33 +42,87 @@ class Distro {
     required this.markerFile,
     this.postInstallNote,
     this.gentooAutobuilds,
+    this.alpineLatest,
   });
 
   bool supportsAbi(String abi) =>
-      archUrls.containsKey(abi) || (gentooAutobuilds?.containsKey(abi) ?? false);
+      archUrls.containsKey(abi) ||
+      (gentooAutobuilds?.containsKey(abi) ?? false) ||
+      (alpineLatest?.containsKey(abi) ?? false);
 }
 
 /// Cấu hình để tự dò bản Gentoo stage3 mới nhất từ thư mục autobuilds/.
 class GentooAutobuild {
-  final String archPath; // 'arm64' | 'arm' - phần đường dẫn trong URL Gentoo
-  final String profile;  // 'arm64-openrc' | 'armv7a-openrc' - phần tên trong file stage3
+  final String archPath;   // 'arm64' | 'arm'
+  final String profile;    // 'arm64-openrc' | 'armv7a_hardfp-t64-openrc'
+  final String latestFile; // tên file latest-stage3-*.txt
 
-  const GentooAutobuild({required this.archPath, required this.profile});
+  const GentooAutobuild({
+    required this.archPath,
+    required this.profile,
+    required this.latestFile,
+  });
+
+  /// URL đầy đủ đến file latest-stage3-*.txt
+  String get latestUrl =>
+      'https://distfiles.gentoo.org/releases/$archPath/autobuilds/'
+      'current-stage3-$profile/$latestFile';
+
+  /// Thư mục chứa tarball (dùng để ghép URL sau khi đọc tên file).
+  String get tarballBaseUrl =>
+      'https://distfiles.gentoo.org/releases/$archPath/autobuilds/'
+      'current-stage3-$profile/';
+}
+
+/// Cấu hình để tự dò bản Alpine minirootfs mới nhất.
+///
+/// LÝ DO: URL kiểu cũ
+///   .../alpine/v3.19/releases/aarch64/alpine-minirootfs-3.19.9-aarch64.tar.gz
+/// trỏ cứng vào 1 point-release cụ thể. Khi Alpine ra bản mới và xoá bản cũ
+/// khỏi mirror, URL trả 404 → app thử tải lại nhiều lần → "bug phải tải lại
+/// rootfs của Alpine". Giải pháp: đọc `latest-releases.yaml` (Alpine duy trì
+/// ổn định tại mỗi branch) và lấy tên file minirootfs mới nhất.
+class AlpineLatest {
+  /// Nhánh stable ('latest-stable', 'v3.20', 'v3.21', ...).
+  final String branch;
+  /// Tên kiến trúc trong URL Alpine ('aarch64' | 'armv7' | 'x86_64' ...).
+  final String arch;
+  /// Loại rootfs cần tải (mặc định 'minirootfs').
+  final String variant;
+
+  const AlpineLatest({
+    required this.branch,
+    required this.arch,
+    this.variant = 'minirootfs',
+  });
+
+  String get baseUrl =>
+      'https://dl-cdn.alpinelinux.org/alpine/$branch/releases/$arch/';
+
+  /// File YAML liệt kê các bản release mới nhất của branch.
+  String get yamlUrl => '${baseUrl}latest-releases.yaml';
 }
 
 class Distros {
+  /// Alpine: URL resolve động qua latest-releases.yaml → không còn 404 khi
+  /// Alpine xoá point-release cũ, hết cảnh "phải tải lại rootfs".
   static const alpine = Distro(
     id: 'alpine',
     displayName: 'Alpine Linux',
     description: 'Siêu nhẹ (~8MB), dùng apk. Khởi động nhanh nhất, phù hợp '
         'máy yếu/ít bộ nhớ.',
-    archUrls: {
-      'arm64-v8a':
-          'https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/aarch64/alpine-minirootfs-3.19.9-aarch64.tar.gz',
-      'armeabi-v7a':
-          'https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/armv7/alpine-minirootfs-3.19.9-armv7.tar.gz',
-    },
+    archUrls: {}, // resolve động qua alpineLatest
     markerFile: 'etc/alpine-release',
+    alpineLatest: {
+      'arm64-v8a': AlpineLatest(
+        branch: 'latest-stable',
+        arch: 'aarch64',
+      ),
+      'armeabi-v7a': AlpineLatest(
+        branch: 'latest-stable',
+        arch: 'armv7',
+      ),
+    },
   );
 
   static const ubuntu = Distro(
@@ -85,8 +145,10 @@ class Distros {
     description: 'Rolling release, dùng pacman. LƯU Ý: tarball chính thức '
         '~800MB+ (kèm gói kernel không dùng tới trong proot).',
     archUrls: {
-      'arm64-v8a': 'http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz',
-      'armeabi-v7a': 'http://os.archlinuxarm.org/os/ArchLinuxARM-armv7-latest.tar.gz',
+      'arm64-v8a':
+          'http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz',
+      'armeabi-v7a':
+          'http://os.archlinuxarm.org/os/ArchLinuxARM-armv7-latest.tar.gz',
     },
     markerFile: 'etc/arch-release',
   );
@@ -100,8 +162,16 @@ class Distros {
     isXz: true,
     markerFile: 'etc/gentoo-release',
     gentooAutobuilds: {
-      'arm64-v8a': GentooAutobuild(archPath: 'arm64', profile: 'arm64-openrc'),
-      'armeabi-v7a': GentooAutobuild(archPath: 'arm', profile: 'armv7a-openrc'),
+      'arm64-v8a': GentooAutobuild(
+        archPath: 'arm64',
+        profile: 'arm64-openrc',
+        latestFile: 'latest-stage3-arm64-openrc.txt',
+      ),
+      'armeabi-v7a': GentooAutobuild(
+        archPath: 'arm',
+        profile: 'armv7a_hardfp-t64-openrc',
+        latestFile: 'latest-stage3-armv7a_hardfp-t64-openrc.txt',
+      ),
     },
     postInstallNote:
         '⚠️ Gentoo mới cài chỉ có stage3 gốc, CHƯA có portage tree (danh '
