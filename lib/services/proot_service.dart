@@ -106,39 +106,63 @@ class PRootService {
     Directory(rootfs).createSync(recursive: true);
 
     // ── Xác định URL tải tarball ──
-    // Đa số distro có URL cố định (archUrls). Riêng Gentoo xoá các bản cũ
-    // theo thời gian, và cả symlink "current-stage3-*" (cách cũ) đôi khi
-    // 404 tuỳ mirror/route - nên thay vào đó TỰ QUÉT thư mục autobuilds/
-    // (endpoint ổn định, không phải symlink) để tìm thư mục ngày-giờ mới
-    // nhất, rồi tự suy ra tên file - giống hệt cách làm thủ công.
-    String url;
+    // 3 trường hợp:
+    //   1. archUrls có URL tĩnh (Ubuntu, Arch).
+    //   2. gentooAutobuilds: Gentoo xoá bản build cũ theo thời gian → đọc
+    //      latest-stage3-*.txt (endpoint ổn định, không phải symlink) để lấy
+    //      tên tarball mới nhất, tránh 404 khi mirror xoá bản cũ.
+    //   3. alpineLatest: Alpine xoá point-release cũ khỏi mirror → đọc
+    //      latest-releases.yaml để lấy tên minirootfs mới nhất. Đây là fix
+    //      cho bug "phải tải lại rootfs Alpine" khi URL cũ 404.
+    final String url;
     if (distro.archUrls.containsKey(abi)) {
       url = distro.archUrls[abi]!;
-    } else {
+    } else if (distro.gentooAutobuilds?.containsKey(abi) ?? false) {
       final cfg = distro.gentooAutobuilds![abi]!;
-      final listUrl = 'https://distfiles.gentoo.org/releases/${cfg.archPath}/autobuilds/';
-      _log('🔎 Đang dò bản Gentoo mới nhất ($abi)...\n$listUrl');
-
-      final listResp = await http.get(Uri.parse(listUrl));
-      if (listResp.statusCode != 200) {
-        throw Exception('Không đọc được danh sách bản build: HTTP ${listResp.statusCode}');
+      _log('🔎 Đang dò bản Gentoo mới nhất ($abi)...\n${cfg.latestUrl}');
+      final resp = await http.get(Uri.parse(cfg.latestUrl));
+      if (resp.statusCode != 200) {
+        throw Exception(
+            'Không đọc được ${cfg.latestFile}: HTTP ${resp.statusCode}');
       }
-      // Thư mục con dạng "20260830T234553Z/" - tên có thể sort được trực
-      // tiếp dạng chuỗi vì đúng định dạng ISO8601 rút gọn (chuỗi lớn hơn
-      // = ngày sau hơn), không cần parse ra DateTime.
-      final timestamps = RegExp(r'href="(\d{8}T\d{6}Z)/"')
-          .allMatches(listResp.body)
-          .map((m) => m.group(1)!)
-          .toSet()
-          .toList()
-        ..sort();
-      if (timestamps.isEmpty) {
-        throw Exception('Không tìm thấy bản build nào tại $listUrl (Gentoo đổi cấu trúc thư mục?)');
+      // Nội dung file dạng:
+      //   # Latest as of ...
+      //   20250928T170227Z/stage3-arm64-openrc-20250928T170227Z.tar.xz 311603336
+      // Chỉ cần basename tarball, ghép vào tarballBaseUrl (vì
+      // current-stage3-* là symlink tới thư mục timestamp tương ứng).
+      final m = RegExp(r'(\S+\.tar\.xz)').firstMatch(resp.body);
+      if (m == null) {
+        throw Exception(
+            'Không tìm thấy tarball .tar.xz trong ${cfg.latestFile}');
       }
-      final latest = timestamps.last;
-      url = 'https://distfiles.gentoo.org/releases/${cfg.archPath}/autobuilds/$latest/'
-          'stage3-${cfg.profile}-$latest.tar.xz';
-      _log('   -> bản mới nhất: $latest');
+      final tarballPath = m.group(1)!;
+      final tarballName = tarballPath.contains('/')
+          ? tarballPath.split('/').last
+          : tarballPath;
+      url = '${cfg.tarballBaseUrl}$tarballName';
+      _log('   -> tarball: $tarballName');
+    } else if (distro.alpineLatest?.containsKey(abi) ?? false) {
+      final cfg = distro.alpineLatest![abi]!;
+      _log('🔎 Đang dò bản Alpine mới nhất ($abi)...\n${cfg.yamlUrl}');
+      final resp = await http.get(Uri.parse(cfg.yamlUrl));
+      if (resp.statusCode != 200) {
+        throw Exception(
+            'Không đọc được latest-releases.yaml: HTTP ${resp.statusCode}');
+      }
+      // Dòng dạng: "- file: alpine-minirootfs-3.22.1-aarch64.tar.gz"
+      final pattern = RegExp(
+          'alpine-${RegExp.escape(cfg.variant)}-[^\\s"\']+\\.tar\\.gz');
+      final m = pattern.firstMatch(resp.body);
+      if (m == null) {
+        throw Exception(
+            'Không tìm thấy ${cfg.variant} trong latest-releases.yaml');
+      }
+      final tarballName = m.group(0)!;
+      url = '${cfg.baseUrl}$tarballName';
+      _log('   -> tarball: $tarballName');
+    } else {
+      throw Exception(
+          'Không xác định được URL tải cho ${distro.displayName} ($abi).');
     }
 
     final ext = distro.isXz ? 'tar.xz' : 'tar.gz';
