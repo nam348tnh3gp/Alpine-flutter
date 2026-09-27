@@ -8,7 +8,7 @@ class Distro {
   final String description;
 
   /// abi ('arm64-v8a' | 'armeabi-v7a') -> URL tải tarball trực tiếp.
-  /// Rỗng nếu distro cần resolve URL động (xem [latestTxtUrls]).
+  /// Rỗng nếu distro cần resolve URL động (xem [gentooAutobuilds]).
   final Map<String, String> archUrls;
 
   /// true nếu tarball nén .tar.xz (cần XZDecoder), false = .tar.gz (gzip).
@@ -20,11 +20,12 @@ class Distro {
   /// Ghi thêm vào log sau khi cài xong, nếu distro cần lưu ý gì thêm.
   final String? postInstallNote;
 
-  /// Một số distro (vd Gentoo) xoá các bản build cũ theo thời gian nên
-  /// KHÔNG thể ghim tên file tarball cố định - phải tải 1 file .txt nhỏ
-  /// trỏ tới tên file mới nhất trước, rồi mới build URL tarball thật từ
-  /// đó (cùng thư mục với file .txt).
-  final Map<String, String>? latestTxtUrls;
+  /// Gentoo xoá các bản build cũ theo thời gian, và ngay cả symlink
+  /// "current-stage3-*" (dùng ở bản trước) đôi khi 404 tuỳ mirror/route -
+  /// nên thay vào đó ta tự quét thư mục autobuilds/ (luôn ổn định, không
+  /// phải symlink) để tìm thư mục ngày-giờ MỚI NHẤT, rồi tự suy ra tên
+  /// file thay vì phụ thuộc bất kỳ con trỏ "latest" nào của Gentoo.
+  final Map<String, GentooAutobuild>? gentooAutobuilds;
 
   const Distro({
     required this.id,
@@ -34,11 +35,19 @@ class Distro {
     this.isXz = false,
     required this.markerFile,
     this.postInstallNote,
-    this.latestTxtUrls,
+    this.gentooAutobuilds,
   });
 
   bool supportsAbi(String abi) =>
-      archUrls.containsKey(abi) || (latestTxtUrls?.containsKey(abi) ?? false);
+      archUrls.containsKey(abi) || (gentooAutobuilds?.containsKey(abi) ?? false);
+}
+
+/// Cấu hình để tự dò bản Gentoo stage3 mới nhất từ thư mục autobuilds/.
+class GentooAutobuild {
+  final String archPath; // 'arm64' | 'arm' - phần đường dẫn trong URL Gentoo
+  final String profile;  // 'arm64-openrc' | 'armv7a-openrc' - phần tên trong file stage3
+
+  const GentooAutobuild({required this.archPath, required this.profile});
 }
 
 class Distros {
@@ -74,10 +83,10 @@ class Distros {
     id: 'arch',
     displayName: 'Arch Linux ARM',
     description: 'Rolling release, dùng pacman. LƯU Ý: tarball chính thức '
-        '~800MB+ (kèm gói kernel không dùng tới trong proot) - chỉ hỗ trợ '
-        'thiết bị 64-bit (arm64-v8a).',
+        '~800MB+ (kèm gói kernel không dùng tới trong proot).',
     archUrls: {
       'arm64-v8a': 'http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz',
+      'armeabi-v7a': 'http://os.archlinuxarm.org/os/ArchLinuxARM-armv7-latest.tar.gz',
     },
     markerFile: 'etc/arch-release',
   );
@@ -90,11 +99,9 @@ class Distros {
     archUrls: {},
     isXz: true,
     markerFile: 'etc/gentoo-release',
-    latestTxtUrls: {
-      'arm64-v8a':
-          'https://distfiles.gentoo.org/releases/arm64/autobuilds/current-stage3-arm64-openrc/latest-stage3-arm64-openrc.txt',
-      'armeabi-v7a':
-          'https://distfiles.gentoo.org/releases/arm/autobuilds/current-stage3-armv7a-openrc/latest-stage3-armv7a-openrc.txt',
+    gentooAutobuilds: {
+      'arm64-v8a': GentooAutobuild(archPath: 'arm64', profile: 'arm64-openrc'),
+      'armeabi-v7a': GentooAutobuild(archPath: 'arm', profile: 'armv7a-openrc'),
     },
     postInstallNote:
         '⚠️ Gentoo mới cài chỉ có stage3 gốc, CHƯA có portage tree (danh '
