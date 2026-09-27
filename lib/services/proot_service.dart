@@ -107,30 +107,38 @@ class PRootService {
 
     // ── Xác định URL tải tarball ──
     // Đa số distro có URL cố định (archUrls). Riêng Gentoo xoá các bản cũ
-    // theo thời gian nên phải tải 1 file .txt nhỏ để biết tên file MỚI
-    // NHẤT trước, rồi mới ghép ra URL tarball thật (cùng thư mục).
+    // theo thời gian, và cả symlink "current-stage3-*" (cách cũ) đôi khi
+    // 404 tuỳ mirror/route - nên thay vào đó TỰ QUÉT thư mục autobuilds/
+    // (endpoint ổn định, không phải symlink) để tìm thư mục ngày-giờ mới
+    // nhất, rồi tự suy ra tên file - giống hệt cách làm thủ công.
     String url;
     if (distro.archUrls.containsKey(abi)) {
       url = distro.archUrls[abi]!;
     } else {
-      final txtUrl = distro.latestTxtUrls![abi]!;
-      _log('🔎 Đang dò tên bản mới nhất của ${distro.displayName}...\n$txtUrl');
-      final txtResp = await http.get(Uri.parse(txtUrl));
-      if (txtResp.statusCode != 200) {
-        throw Exception('Không lấy được thông tin bản mới nhất: HTTP ${txtResp.statusCode}');
+      final cfg = distro.gentooAutobuilds![abi]!;
+      final listUrl = 'https://distfiles.gentoo.org/releases/${cfg.archPath}/autobuilds/';
+      _log('🔎 Đang dò bản Gentoo mới nhất ($abi)...\n$listUrl');
+
+      final listResp = await http.get(Uri.parse(listUrl));
+      if (listResp.statusCode != 200) {
+        throw Exception('Không đọc được danh sách bản build: HTTP ${listResp.statusCode}');
       }
-      String? filename;
-      for (final line in txtResp.body.split('\n')) {
-        final trimmed = line.trim();
-        if (trimmed.isEmpty || trimmed.startsWith('#')) continue;
-        filename = trimmed.split(RegExp(r'\s+')).first;
-        break;
+      // Thư mục con dạng "20260830T234553Z/" - tên có thể sort được trực
+      // tiếp dạng chuỗi vì đúng định dạng ISO8601 rút gọn (chuỗi lớn hơn
+      // = ngày sau hơn), không cần parse ra DateTime.
+      final timestamps = RegExp(r'href="(\d{8}T\d{6}Z)/"')
+          .allMatches(listResp.body)
+          .map((m) => m.group(1)!)
+          .toSet()
+          .toList()
+        ..sort();
+      if (timestamps.isEmpty) {
+        throw Exception('Không tìm thấy bản build nào tại $listUrl (Gentoo đổi cấu trúc thư mục?)');
       }
-      if (filename == null || filename.isEmpty) {
-        throw Exception('Không đọc được tên file từ $txtUrl (định dạng đã đổi?)');
-      }
-      final baseDir = txtUrl.substring(0, txtUrl.lastIndexOf('/') + 1);
-      url = '$baseDir$filename';
+      final latest = timestamps.last;
+      url = 'https://distfiles.gentoo.org/releases/${cfg.archPath}/autobuilds/$latest/'
+          'stage3-${cfg.profile}-$latest.tar.xz';
+      _log('   -> bản mới nhất: $latest');
     }
 
     final ext = distro.isXz ? 'tar.xz' : 'tar.gz';
