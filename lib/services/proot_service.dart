@@ -168,23 +168,74 @@ class PRootService {
     final ext = distro.isXz ? 'tar.xz' : 'tar.gz';
     _log('📥 Đang tải ${distro.displayName} rootfs ($abi)...\n$url');
 
+    // ── Tải file nén ──
+    // FIX:
+    //   - Dùng http.Client() và close() trong finally (trước đây leak client).
+    //   - try/catch/finally đảm bảo sink luôn được close và file rác bị xoá
+    //     khi mạng đứt giữa chừng.
+    //   - Kiểm tra received < total để bắt trường hợp tải cụt.
+    //   - Fallback progress khi server không trả Content-Length.
     final archivePath = '$filesDir/${distro.id}-rootfs.$ext';
-    final request = http.Request('GET', Uri.parse(url));
-    final response = await http.Client().send(request);
+    final archiveFile = File(archivePath);
 
-    if (response.statusCode != 200) {
-      throw Exception('Tải rootfs thất bại: HTTP ${response.statusCode}.');
+    // Xoá file dở từ lần trước (nếu có) để không nhầm lẫn.
+    if (archiveFile.existsSync()) {
+      try {
+        archiveFile.deleteSync();
+      } catch (_) {}
     }
 
-    final total = response.contentLength ?? 0;
-    var received = 0;
-    final sink = File(archivePath).openWrite();
-    await for (final chunk in response.stream) {
-      sink.add(chunk);
-      received += chunk.length;
-      if (total > 0) onProgress(received / total * 0.7);
+    final client = http.Client();
+    IOSink? sink;
+    try {
+      final request = http.Request('GET', Uri.parse(url));
+      final response = await client.send(request);
+
+      if (response.statusCode != 200) {
+        throw Exception('Tải rootfs thất bại: HTTP ${response.statusCode}.');
+      }
+
+      final total = response.contentLength ?? 0;
+      var received = 0;
+      sink = archiveFile.openWrite();
+
+      await for (final chunk in response.stream) {
+        sink.add(chunk);
+        received += chunk.length;
+        if (total > 0) {
+          onProgress(received / total * 0.7);
+        } else {
+          // Không có Content-Length → nhích progress theo từng MB để UI
+          // không đứng im ở 0%, dùng dải 0.10 → 0.69.
+          onProgress(0.10 + ((received ~/ (1024 * 1024)) % 40) / 40 * 0.59);
+        }
+      }
+
+      await sink.flush();
+      await sink.close();
+      sink = null;
+
+      // Bắt trường hợp stream kết thúc bình thường nhưng thiếu byte.
+      if (total > 0 && received < total) {
+        throw Exception(
+            'Tải rootfs không đầy đủ: $received/$total bytes.');
+      }
+      if (received == 0) {
+        throw Exception('Tải rootfs thất bại: file rỗng.');
+      }
+    } catch (e) {
+      // Đóng sink (nếu chưa) + xoá file rác trước khi ném lỗi lên UI.
+      try {
+        await sink?.close();
+      } catch (_) {}
+      try {
+        if (archiveFile.existsSync()) archiveFile.deleteSync();
+      } catch (_) {}
+      _log('❌ Tải rootfs thất bại: $e');
+      rethrow;
+    } finally {
+      client.close();
     }
-    await sink.close();
 
     onProgress(0.72);
     var fileCount = 0, dirCount = 0, linkCount = 0;
@@ -195,7 +246,7 @@ class PRootService {
       // hơn nhánh .tar.gz bên dưới - stage3 Gentoo giải nén ra có thể tới
       // hàng trăm MB - 1GB+, máy ít RAM có thể lỗi ở bước này).
       _log('📦 Giải nén .tar.xz (${distro.displayName}) - có thể mất một lúc và tốn RAM...');
-      final xzBytes = await File(archivePath).readAsBytes();
+      final xzBytes = await archiveFile.readAsBytes();
       final tarBytes = XZDecoder().decodeBytes(xzBytes);
       onProgress(0.8);
       final counts = await _extractTarStream(Stream.value(tarBytes), rootfs);
@@ -204,7 +255,7 @@ class PRootService {
       linkCount = counts.$3;
     } else {
       _log('📦 Giải nén rootfs bằng package:tar (hỗ trợ symlink đầy đủ)...');
-      final tarStream = File(archivePath).openRead().transform(gzip.decoder);
+      final tarStream = archiveFile.openRead().transform(gzip.decoder);
       final counts = await _extractTarStream(tarStream, rootfs);
       fileCount = counts.$1;
       dirCount = counts.$2;
@@ -213,7 +264,12 @@ class PRootService {
     _log('   -> $fileCount file, $dirCount thư mục, $linkCount symlink');
     onProgress(0.88);
 
-    await File(archivePath).delete().catchError((_) => File(archivePath));
+    // Xoá file nén sau khi giải nén xong. Không dùng
+    // `.catchError((_) => File(...))` vì nó trả về File vô nghĩa và gây
+    // warning analyzer.
+    try {
+      await archiveFile.delete();
+    } catch (_) {}
 
     _log('🔧 Cấp quyền execute cho toàn bộ rootfs...');
     final chmodResult = await Process.run('chmod', ['-R', 'a+rx', rootfs]);
