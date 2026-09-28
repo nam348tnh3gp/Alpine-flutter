@@ -1,13 +1,7 @@
 #!/bin/bash
-# Tải proot + loader/loader32, libtalloc, libandroid-shmem từ Termux.
+# Tải proot + loader/loader32, libtalloc, libandroid-shmem, xz-utils từ Termux.
 # Patch RPATH và đổi tên NEEDED để tương thích trên Android.
 # Chạy trong GitHub Actions.
-#
-# targetSdk=28 giải quyết SELinux W^X nhưng KHÔNG đủ:
-# Alpine binary dùng musl ELF interpreter (/lib/ld-musl-*.so.1) không tồn tại
-# trên Android → kernel không exec được dù SELinux cho phép.
-# Loader (từ gói proot Termux) giải quyết bằng cách tự map ELF vào memory,
-# hoàn toàn bỏ qua kernel execve + ELF interpreter → BẮT BUỘC trên mọi Android.
 
 set -euo pipefail
 
@@ -82,21 +76,18 @@ fetch_proot() {
     local extract_dir="$WORK_DIR/proot-${termux_arch}-extracted"
     termux_extract_deb "$deb_path" "$extract_dir"
 
-    # proot binary
     local src="$extract_dir/data/data/com.termux/files/usr/bin/proot"
     [ -f "$src" ] || { echo "!! Không thấy proot binary" >&2; return 1; }
     cp -f "$src" "$proot_dst"
     chmod 755 "$proot_dst"
     echo "OK: $proot_dst ($(du -h "$proot_dst" | cut -f1))"
 
-    # loader — bắt buộc, xử lý musl ELF interpreter mà Android không có
     local loader_src="$extract_dir/data/data/com.termux/files/usr/libexec/proot/loader"
     [ -f "$loader_src" ] || { echo "!! Không thấy loader tại $loader_src" >&2; return 1; }
     cp -f "$loader_src" "$loader_dst"
     chmod 755 "$loader_dst"
     echo "OK: $loader_dst ($(du -h "$loader_dst" | cut -f1))"
 
-    # loader32 — tùy chọn, chỉ cần cho process 32-bit bên trong rootfs
     local loader32_src="$extract_dir/data/data/com.termux/files/usr/libexec/proot/loader32"
     local loader32_dst="$JNI_DIR/$abi/libproot-loader32.so"
     if [ -f "$loader32_src" ]; then
@@ -174,6 +165,68 @@ fetch_libandroid_shmem() {
     echo "OK: $target_file ($(du -h "$target_file" | cut -f1))"
 }
 
+# ---- xz binary + liblzma (để stream-giải-nén .tar.xz không OOM) ----
+#
+# LÝ DO: Gentoo stage3 ~300MB nén .tar.xz → ~1GB tar. Dùng XZDecoder thuần
+# Dart cần readAsBytes() + decodeBytes() cả 2 trong RAM → peak ~1.3GB →
+# Android OOM-kill app giữa chừng (bug "reload ở 72%").
+# Dùng `xz -dc` native stream stdout → TarReader → peak vài MB.
+
+fetch_xz() {
+    local termux_arch="$1"
+    local abi="${ARCH_MAP[$termux_arch]}"
+    local xz_dst="$JNI_DIR/$abi/libxz.so"
+
+    if [ -f "$xz_dst" ] && [ -s "$xz_dst" ]; then
+        echo "[xz/$termux_arch] Đã tồn tại, bỏ qua"
+        return 0
+    fi
+
+    local filename
+    filename="$(termux_deb_url "$termux_arch" "xz-utils")"
+    [ -z "$filename" ] && { echo "!! xz-utils không tìm thấy cho $termux_arch" >&2; return 1; }
+
+    local deb_url="https://packages.termux.dev/apt/termux-main/${filename}"
+    local deb_path="$WORK_DIR/xz-utils-${termux_arch}.deb"
+    echo "[xz/$termux_arch] Tải từ $deb_url"
+    curl -fsSL "$deb_url" -o "$deb_path"
+
+    local extract_dir="$WORK_DIR/xz-utils-${termux_arch}-extracted"
+    termux_extract_deb "$deb_path" "$extract_dir"
+
+    local src="$extract_dir/data/data/com.termux/files/usr/bin/xz"
+    [ -f "$src" ] || { echo "!! Không thấy xz binary tại $src" >&2; return 1; }
+    cp -f "$src" "$xz_dst"
+    chmod 755 "$xz_dst"
+    echo "OK: $xz_dst ($(du -h "$xz_dst" | cut -f1))"
+
+    # liblzma là NEEDED bắt buộc. Thử lấy luôn từ cùng deb trước,
+    # nếu không có thì tải gói liblzma riêng.
+    local lzma_dst="$JNI_DIR/$abi/liblzma.so"
+    if [ ! -f "$lzma_dst" ] || [ ! -s "$lzma_dst" ]; then
+        local lzma_src=""
+        if [ -d "$extract_dir/data/data/com.termux/files/usr/lib" ]; then
+            lzma_src="$(find "$extract_dir/data/data/com.termux/files/usr/lib" \
+                -name 'liblzma.so*' -type f 2>/dev/null | head -n1)"
+        fi
+        if [ -z "$lzma_src" ]; then
+            lzma_src="$(find "$extract_dir" \
+                -name 'liblzma.so*' -type f 2>/dev/null | head -n1)"
+        fi
+        if [ -n "$lzma_src" ]; then
+            cp -f "$lzma_src" "$lzma_dst"
+            chmod 755 "$lzma_dst"
+            echo "OK: $lzma_dst ($(du -h "$lzma_dst" | cut -f1))"
+        else
+            echo "[xz/$termux_arch] liblzma không có trong xz-utils, tải gói riêng..."
+            fetch_library_by_name "$termux_arch" "liblzma.so" || {
+                echo "!! Không tải được liblzma.so cho $termux_arch" >&2
+                return 1
+            }
+        fi
+    fi
+}
+
 # ---- NEEDED đệ quy ----
 
 SYSTEM_LIBS=("libc.so" "libdl.so" "libm.so" "libpthread.so" "librt.so"
@@ -245,11 +298,12 @@ patch_all_libs() {
 
 # ---- Main ----
 
-echo "=== Tải proot (+ loader), libtalloc, libandroid-shmem ==="
+echo "=== Tải proot (+ loader), libtalloc, libandroid-shmem, xz-utils ==="
 for termux_arch in aarch64 arm; do
     fetch_proot            "$termux_arch" || exit 1
     fetch_libtalloc        "$termux_arch" || exit 1
     fetch_libandroid_shmem "$termux_arch" || exit 1
+    fetch_xz               "$termux_arch" || exit 1
 done
 
 echo "=== Phân tích NEEDED đệ quy ==="
