@@ -139,7 +139,13 @@ class Distros {
     markerFile: 'etc/os-release',
   );
 
-  // ✅ FIX: đổi http:// -> https:// để tránh bị Android 9+ chặn cleartext
+  // ✅ FIX: os.archlinuxarm.org bị lỗi SSL (chứng chỉ không khớp hostname)
+  // → Android chặn kết nối HTTPS. Đổi sang mirror BFSU (chứng chỉ
+  // Let's Encrypt hợp lệ), vẫn giữ đúng cấu trúc thư mục /os/.
+  // Mirror dự phòng nếu BFSU gặp sự cố:
+  //   https://mirrors.tuna.tsinghua.edu.cn/archlinuxarm/os/
+  //   https://mirrors.ustc.edu.cn/archlinuxarm/os/
+  //   https://mirrors.aliyun.com/archlinuxarm/os/
   static const arch = Distro(
     id: 'arch',
     displayName: 'Arch Linux ARM',
@@ -147,9 +153,9 @@ class Distros {
         '~800MB+ (kèm gói kernel không dùng tới trong proot).',
     archUrls: {
       'arm64-v8a':
-          'https://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz',
+          'https://mirrors.bfsu.edu.cn/archlinuxarm/os/ArchLinuxARM-aarch64-latest.tar.gz',
       'armeabi-v7a':
-          'https://os.archlinuxarm.org/os/ArchLinuxARM-armv7-latest.tar.gz',
+          'https://mirrors.bfsu.edu.cn/archlinuxarm/os/ArchLinuxARM-armv7-latest.tar.gz',
     },
     markerFile: 'etc/arch-release',
   );
