@@ -139,6 +139,7 @@ class Distros {
     markerFile: 'etc/os-release',
   );
 
+  // ✅ FIX: đổi http:// -> https:// để tránh bị Android 9+ chặn cleartext
   static const arch = Distro(
     id: 'arch',
     displayName: 'Arch Linux ARM',
@@ -146,9 +147,9 @@ class Distros {
         '~800MB+ (kèm gói kernel không dùng tới trong proot).',
     archUrls: {
       'arm64-v8a':
-          'http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz',
+          'https://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz',
       'armeabi-v7a':
-          'http://os.archlinuxarm.org/os/ArchLinuxARM-armv7-latest.tar.gz',
+          'https://os.archlinuxarm.org/os/ArchLinuxARM-armv7-latest.tar.gz',
     },
     markerFile: 'etc/arch-release',
   );
