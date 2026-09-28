@@ -14,7 +14,7 @@ class FakeProcess implements Process {
   final Completer<int> _exitCodeCompleter = Completer<int>();
   final StreamController<List<int>> _stdoutController = StreamController.broadcast();
   final StreamController<List<int>> _stderrController = StreamController.broadcast();
-  final void Function()? onKill; // Callback để kill đúng session
+  final void Function()? onKill;
 
   FakeProcess(this._pid, this._exitCode, {this.onKill});
 
@@ -80,15 +80,61 @@ class PRootService {
   Future<bool> isInstalled() async {
     final rootfs = await _rootfsDir();
     final markerOk = File('$rootfs/${distro.markerFile}').existsSync();
-    // /bin/sh gần như luôn có trên mọi distro Linux - dùng làm kiểm tra
-    // "rootfs còn nguyên vẹn" chung cho tất cả, thay vì chỉ check busybox
-    // (chỉ Alpine mới có busybox, các distro khác dùng coreutils/dash/bash).
     final shOk = File('$rootfs/bin/sh').existsSync() ||
         File('$rootfs/usr/bin/sh').existsSync();
     if (markerOk && !shOk) {
       _log('⚠️ Phát hiện rootfs ${distro.displayName} cài dở (thiếu /bin/sh) - sẽ cài lại.');
     }
     return markerOk && shOk;
+  }
+
+  /// Chuẩn bị `xz` binary + `liblzma.so` để stream-giải-nén .tar.xz.
+  ///
+  /// QUAN TRỌNG: RPATH của libxz.so là `$ORIGIN` (= thư mục chứa binary).
+  /// Vì jniLibs có thể noexec, ta copy CẢ HAI file ra filesDir (exec được):
+  ///   <libDir>/libxz.so   -> <filesDir>/xz-bin
+  ///   <libDir>/liblzma.so -> <filesDir>/liblzma.so
+  /// Khi exec <filesDir>/xz-bin, linker resolve `liblzma.so` cạnh nó.
+  ///
+  /// Trả null nếu APK không nhúng binary → bootstrap fallback về XZDecoder
+  /// thuần Dart (tốn RAM, có thể OOM với Gentoo).
+  Future<String?> _ensureXzBinary(String libDir, String filesDir) async {
+    final cachedXz = '$filesDir/xz-bin';
+    final cachedLzma = '$filesDir/liblzma.so';
+
+    // Cache hit: đã có cả 2 file → chmod lại (idempotent) và trả luôn.
+    if (File(cachedXz).existsSync() && File(cachedLzma).existsSync()) {
+      final r = await Process.run('chmod', ['+x', cachedXz]);
+      if (r.exitCode == 0) return cachedXz;
+    }
+
+    for (final name in ['libxz.so', 'xz']) {
+      final src = '$libDir/$name';
+      if (!File(src).existsSync()) continue;
+      try {
+        await File(src).copy(cachedXz);
+        final r = await Process.run('chmod', ['+x', cachedXz]);
+        if (r.exitCode != 0) {
+          _log('⚠️ chmod +x $cachedXz thất bại: ${r.stderr}');
+          continue;
+        }
+
+        // Copy liblzma cạnh xz-bin để RPATH `$ORIGIN` tìm được.
+        final lzmaSrc = '$libDir/liblzma.so';
+        if (File(lzmaSrc).existsSync()) {
+          await File(lzmaSrc).copy(cachedLzma);
+          await Process.run('chmod', ['+x', cachedLzma]);
+        } else {
+          _log('⚠️ Không thấy liblzma.so trong $libDir — xz binary có thể không chạy được.');
+        }
+
+        _log('✅ Đã chuẩn bị xz binary từ $name');
+        return cachedXz;
+      } catch (e) {
+        _log('⚠️ Không dùng được $src: $e');
+      }
+    }
+    return null;
   }
 
   Future<void> bootstrap({required void Function(double) onProgress}) async {
@@ -99,6 +145,7 @@ class PRootService {
     }
     final rootfs = await _rootfsDir();
     final filesDir = await NativeBridge.getFilesDir();
+    final libDir = await NativeBridge.getNativeLibraryDir();
 
     if (await Directory(rootfs).exists()) {
       await Directory(rootfs).delete(recursive: true);
@@ -106,14 +153,6 @@ class PRootService {
     Directory(rootfs).createSync(recursive: true);
 
     // ── Xác định URL tải tarball ──
-    // 3 trường hợp:
-    //   1. archUrls có URL tĩnh (Ubuntu, Arch).
-    //   2. gentooAutobuilds: Gentoo xoá bản build cũ theo thời gian → đọc
-    //      latest-stage3-*.txt (endpoint ổn định, không phải symlink) để lấy
-    //      tên tarball mới nhất, tránh 404 khi mirror xoá bản cũ.
-    //   3. alpineLatest: Alpine xoá point-release cũ khỏi mirror → đọc
-    //      latest-releases.yaml để lấy tên minirootfs mới nhất. Đây là fix
-    //      cho bug "phải tải lại rootfs Alpine" khi URL cũ 404.
     final String url;
     if (distro.archUrls.containsKey(abi)) {
       url = distro.archUrls[abi]!;
@@ -125,11 +164,6 @@ class PRootService {
         throw Exception(
             'Không đọc được ${cfg.latestFile}: HTTP ${resp.statusCode}');
       }
-      // Nội dung file dạng:
-      //   # Latest as of ...
-      //   20250928T170227Z/stage3-arm64-openrc-20250928T170227Z.tar.xz 311603336
-      // Chỉ cần basename tarball, ghép vào tarballBaseUrl (vì
-      // current-stage3-* là symlink tới thư mục timestamp tương ứng).
       final m = RegExp(r'(\S+\.tar\.xz)').firstMatch(resp.body);
       if (m == null) {
         throw Exception(
@@ -149,7 +183,6 @@ class PRootService {
         throw Exception(
             'Không đọc được latest-releases.yaml: HTTP ${resp.statusCode}');
       }
-      // Dòng dạng: "- file: alpine-minirootfs-3.22.1-aarch64.tar.gz"
       final pattern = RegExp(
           'alpine-${RegExp.escape(cfg.variant)}-[^\\s"\']+\\.tar\\.gz');
       final m = pattern.firstMatch(resp.body);
@@ -169,20 +202,11 @@ class PRootService {
     _log('📥 Đang tải ${distro.displayName} rootfs ($abi)...\n$url');
 
     // ── Tải file nén ──
-    // FIX:
-    //   - Dùng http.Client() và close() trong finally (trước đây leak client).
-    //   - try/catch/finally đảm bảo sink luôn được close và file rác bị xoá
-    //     khi mạng đứt giữa chừng.
-    //   - Kiểm tra received < total để bắt trường hợp tải cụt.
-    //   - Fallback progress khi server không trả Content-Length.
     final archivePath = '$filesDir/${distro.id}-rootfs.$ext';
     final archiveFile = File(archivePath);
 
-    // Xoá file dở từ lần trước (nếu có) để không nhầm lẫn.
     if (archiveFile.existsSync()) {
-      try {
-        archiveFile.deleteSync();
-      } catch (_) {}
+      try { archiveFile.deleteSync(); } catch (_) {}
     }
 
     final client = http.Client();
@@ -205,8 +229,6 @@ class PRootService {
         if (total > 0) {
           onProgress(received / total * 0.7);
         } else {
-          // Không có Content-Length → nhích progress theo từng MB để UI
-          // không đứng im ở 0%, dùng dải 0.10 → 0.69.
           onProgress(0.10 + ((received ~/ (1024 * 1024)) % 40) / 40 * 0.59);
         }
       }
@@ -215,7 +237,6 @@ class PRootService {
       await sink.close();
       sink = null;
 
-      // Bắt trường hợp stream kết thúc bình thường nhưng thiếu byte.
       if (total > 0 && received < total) {
         throw Exception(
             'Tải rootfs không đầy đủ: $received/$total bytes.');
@@ -224,13 +245,8 @@ class PRootService {
         throw Exception('Tải rootfs thất bại: file rỗng.');
       }
     } catch (e) {
-      // Đóng sink (nếu chưa) + xoá file rác trước khi ném lỗi lên UI.
-      try {
-        await sink?.close();
-      } catch (_) {}
-      try {
-        if (archiveFile.existsSync()) archiveFile.deleteSync();
-      } catch (_) {}
+      try { await sink?.close(); } catch (_) {}
+      try { if (archiveFile.existsSync()) archiveFile.deleteSync(); } catch (_) {}
       _log('❌ Tải rootfs thất bại: $e');
       rethrow;
     } finally {
@@ -241,18 +257,54 @@ class PRootService {
     var fileCount = 0, dirCount = 0, linkCount = 0;
 
     if (distro.isXz) {
-      // Không có API giải nén .tar.xz dạng stream ổn định trong Dart, nên
-      // phải đọc + giải nén toàn bộ vào RAM trước (LƯU Ý: tốn nhiều bộ nhớ
-      // hơn nhánh .tar.gz bên dưới - stage3 Gentoo giải nén ra có thể tới
-      // hàng trăm MB - 1GB+, máy ít RAM có thể lỗi ở bước này).
-      _log('📦 Giải nén .tar.xz (${distro.displayName}) - có thể mất một lúc và tốn RAM...');
-      final xzBytes = await archiveFile.readAsBytes();
-      final tarBytes = XZDecoder().decodeBytes(xzBytes);
-      onProgress(0.8);
-      final counts = await _extractTarStream(Stream.value(tarBytes), rootfs);
-      fileCount = counts.$1;
-      dirCount = counts.$2;
-      linkCount = counts.$3;
+      // ── FIX OOM 72% ──
+      // Trước đây: readAsBytes() + XZDecoder().decodeBytes() → peak RAM
+      // ~1.3GB với Gentoo stage3 → Android OOM-kill → app "reload" ở 72%.
+      // Giờ: ưu tiên xz binary native (stream stdout → TarReader, peak vài
+      // MB), chỉ fallback về XZDecoder thuần Dart khi APK chưa nhúng binary.
+      _log('📦 Giải nén .tar.xz (${distro.displayName})...');
+
+      final xzBin = await _ensureXzBinary(libDir, filesDir);
+      if (xzBin != null) {
+        _log('   -> dùng native xz (stream, RAM thấp)');
+        final proc = await Process.start(xzBin, ['-d', '-c', archivePath]);
+
+        // Drain stderr để pipe không bị đầy (xz in warning ra stderr).
+        final stderrBuf = StringBuffer();
+        final stderrSub = proc.stderr
+            .transform(utf8.decoder)
+            .listen(stderrBuf.write);
+
+        try {
+          // TarReader consume trực tiếp stdout của xz → không cần buffer
+          // toàn bộ tar vào RAM.
+          final counts = await _extractTarStream(proc.stdout, rootfs);
+          final exitCode = await proc.exitCode;
+          if (exitCode != 0) {
+            throw Exception(
+                'xz thoát với code $exitCode: ${stderrBuf.toString().trim()}');
+          }
+          fileCount = counts.$1;
+          dirCount = counts.$2;
+          linkCount = counts.$3;
+        } catch (e) {
+          proc.kill(ProcessSignal.sigkill);
+          rethrow;
+        } finally {
+          await stderrSub.cancel();
+        }
+      } else {
+        _log('   ⚠️ Không tìm thấy xz binary trong APK — dùng XZDecoder '
+            'thuần Dart. Với Gentoo stage3 (~300MB nén → ~1GB tar) có thể '
+            'OOM. Nhúng `libxz.so` + `liblzma.so` vào jniLibs để fix triệt để.');
+        final xzBytes = await archiveFile.readAsBytes();
+        final tarBytes = XZDecoder().decodeBytes(xzBytes);
+        onProgress(0.8);
+        final counts = await _extractTarStream(Stream.value(tarBytes), rootfs);
+        fileCount = counts.$1;
+        dirCount = counts.$2;
+        linkCount = counts.$3;
+      }
     } else {
       _log('📦 Giải nén rootfs bằng package:tar (hỗ trợ symlink đầy đủ)...');
       final tarStream = archiveFile.openRead().transform(gzip.decoder);
@@ -264,9 +316,6 @@ class PRootService {
     _log('   -> $fileCount file, $dirCount thư mục, $linkCount symlink');
     onProgress(0.88);
 
-    // Xoá file nén sau khi giải nén xong. Không dùng
-    // `.catchError((_) => File(...))` vì nó trả về File vô nghĩa và gây
-    // warning analyzer.
     try {
       await archiveFile.delete();
     } catch (_) {}
@@ -278,8 +327,6 @@ class PRootService {
           '${chmodResult.stderr}');
     }
 
-    // Chỉ Alpine dùng busybox - các distro khác (Ubuntu/Arch/Gentoo) đã có
-    // sẵn /bin/sh thật (dash/bash) từ trong tarball, KHÔNG được đè lên.
     if (distro.id == 'alpine') {
       final shLink = Link('$rootfs/bin/sh');
       if (!shLink.existsSync()) {
@@ -307,8 +354,6 @@ class PRootService {
   }
 
   /// Giải nén 1 tar stream (đã giải nén sẵn khỏi gzip/xz) ra [rootfs].
-  /// Dùng chung cho cả nhánh .tar.gz và .tar.xz để không lặp code xử lý
-  /// symlink/thư mục/file.
   Future<(int, int, int)> _extractTarStream(
       Stream<List<int>> tarStream, String rootfs) async {
     var fileCount = 0, dirCount = 0, linkCount = 0;
@@ -429,16 +474,13 @@ class PRootService {
 
     _logSub = ProotJNI.onLog.listen((line) {
       if (line.startsWith('[$_sessionId][pty]')) {
-        // Bỏ prefix và truyền nguyên vẹn (không trim, không thêm \n)
         String content = line.substring('[$_sessionId][pty]'.length);
         if (content.isNotEmpty) {
-          final data = utf8.encode(content); // raw bytes
+          final data = utf8.encode(content);
           fake.addStdout(data);
-          onStdout?.call(content); // truyền raw string
+          onStdout?.call(content);
         }
       } else {
-        // Log thường từ launcher: chỉ lưu vào buffer để dùng cho nút "Copy log",
-        // không in ra terminal để tránh nhiễu.
         if (line.startsWith('[$_sessionId]')) {
           _logBuffer.writeln(line.substring('[$_sessionId]'.length));
           final bytes = utf8.encode('$line\n');
@@ -485,7 +527,7 @@ class PRootService {
 
   void stop() {
     if (_currentProcess != null) {
-      _currentProcess?.kill(); // Gọi callback kill session
+      _currentProcess?.kill();
       _currentProcess = null;
     }
     _running = false;
