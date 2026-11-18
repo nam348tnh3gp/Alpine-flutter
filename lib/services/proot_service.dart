@@ -89,21 +89,10 @@ class PRootService {
     return markerOk && shOk;
   }
 
-  /// Chuẩn bị `xz` binary + `liblzma.so` để stream-giải-nén .tar.xz.
-  ///
-  /// QUAN TRỌNG: RPATH của libxz.so là `$ORIGIN` (= thư mục chứa binary).
-  /// Vì jniLibs có thể noexec, ta copy CẢ HAI file ra filesDir (exec được):
-  ///   <libDir>/libxz.so   -> <filesDir>/xz-bin
-  ///   <libDir>/liblzma.so -> <filesDir>/liblzma.so
-  /// Khi exec <filesDir>/xz-bin, linker resolve `liblzma.so` cạnh nó.
-  ///
-  /// Trả null nếu APK không nhúng binary → bootstrap fallback về XZDecoder
-  /// thuần Dart (tốn RAM, có thể OOM với Gentoo).
   Future<String?> _ensureXzBinary(String libDir, String filesDir) async {
     final cachedXz = '$filesDir/xz-bin';
     final cachedLzma = '$filesDir/liblzma.so';
 
-    // Cache hit: đã có cả 2 file → chmod lại (idempotent) và trả luôn.
     if (File(cachedXz).existsSync() && File(cachedLzma).existsSync()) {
       final r = await Process.run('chmod', ['+x', cachedXz]);
       if (r.exitCode == 0) return cachedXz;
@@ -120,7 +109,6 @@ class PRootService {
           continue;
         }
 
-        // Copy liblzma cạnh xz-bin để RPATH `$ORIGIN` tìm được.
         final lzmaSrc = '$libDir/liblzma.so';
         if (File(lzmaSrc).existsSync()) {
           await File(lzmaSrc).copy(cachedLzma);
@@ -137,10 +125,6 @@ class PRootService {
     }
     return null;
   }
-
-  // ─────────────────────────────────────────────────────────────────────
-  // Download: retry + mirror fallback
-  // ─────────────────────────────────────────────────────────────────────
 
   Future<bool> _downloadWithFallback({
     required List<String> urls,
@@ -222,17 +206,11 @@ class PRootService {
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────
-  // URL resolution (Alpine / Gentoo resolve động)
-  // ─────────────────────────────────────────────────────────────────────
-
   Future<List<String>> _resolveUrls(String abi) async {
-    // Static URLs (có thể nhiều mirror)
     if (distro.archUrls.containsKey(abi)) {
       return List<String>.from(distro.archUrls[abi]!);
     }
 
-    // Gentoo: đọc latest-stage3-*.txt
     if (distro.gentooAutobuilds?.containsKey(abi) ?? false) {
       final cfg = distro.gentooAutobuilds![abi]!;
       _log('🔎 Đang dò bản Gentoo mới nhất ($abi)...\n${cfg.latestUrl}');
@@ -255,7 +233,6 @@ class PRootService {
       return [url];
     }
 
-    // Alpine: đọc latest-releases.yaml
     if (distro.alpineLatest?.containsKey(abi) ?? false) {
       final cfg = distro.alpineLatest![abi]!;
       _log('🔎 Đang dò bản Alpine mới nhất ($abi)...\n${cfg.yamlUrl}');
@@ -281,10 +258,6 @@ class PRootService {
         'Không xác định được URL tải cho ${distro.displayName} ($abi).');
   }
 
-  // ─────────────────────────────────────────────────────────────────────
-  // Bootstrap
-  // ─────────────────────────────────────────────────────────────────────
-
   Future<void> bootstrap({required void Function(double) onProgress}) async {
     final abi = await NativeBridge.getAbi();
     if (!distro.supportsAbi(abi)) {
@@ -300,7 +273,6 @@ class PRootService {
     }
     Directory(rootfs).createSync(recursive: true);
 
-    // ── Xác định URL(s) ──
     final urls = await _resolveUrls(abi);
 
     final ext = distro.isXz ? 'tar.xz' : 'tar.gz';
@@ -311,7 +283,6 @@ class PRootService {
       try { archiveFile.deleteSync(); } catch (_) {}
     }
 
-    // ── Tải (retry + mirror fallback) ──
     final downloaded = await _downloadWithFallback(
       urls: urls,
       dest: archiveFile,
@@ -326,11 +297,6 @@ class PRootService {
     var fileCount = 0, dirCount = 0, linkCount = 0;
 
     if (distro.isXz) {
-      // ── FIX OOM 72% ──
-      // Trước đây: readAsBytes() + XZDecoder().decodeBytes() → peak RAM
-      // ~1.3GB với Gentoo stage3 → Android OOM-kill → app "reload" ở 72%.
-      // Giờ: ưu tiên xz binary native (stream stdout → TarReader, peak vài
-      // MB), chỉ fallback về XZDecoder thuần Dart khi APK chưa nhúng binary.
       _log('📦 Giải nén .tar.xz (${distro.displayName})...');
 
       final xzBin = await _ensureXzBinary(libDir, filesDir);
@@ -338,7 +304,6 @@ class PRootService {
         _log('   -> dùng native xz (stream, RAM thấp)');
         final proc = await Process.start(xzBin, ['-d', '-c', archiveFile.path]);
 
-        // Drain stderr để pipe không bị đầy (xz in warning ra stderr).
         final stderrBuf = StringBuffer();
         final stderrSub = proc.stderr
             .transform(utf8.decoder)
@@ -349,7 +314,6 @@ class PRootService {
             proc.stdout,
             rootfs,
             onProgress: (n) {
-              // Scale progress từ 0.72 → 0.87 trong lúc extract.
               onProgress((0.72 + 0.15 * ((n % 200) / 200)).clamp(0.72, 0.87));
             },
           );
@@ -400,31 +364,15 @@ class PRootService {
       await archiveFile.delete();
     } catch (_) {}
 
-    // ── Quyền execute (tối ưu: chỉ chmod thư mục + bin/sbin) ──
-    // `chmod -R a+rx` trên Arch/Gentoo (800MB+) cực chậm và không cần thiết:
-    //   • Permission của file đã được tar giữ nguyên từ tarball.
-    //   • Chỉ cần đảm bảo MỌI THƯ MỤC có +x (traversal) và các binary
-    //     cốt lõi trong bin/sbin có +x (Android có thể strip khi extract
-    //     tarball nếu là root, nhưng ở đây ta extract bằng chính app nên
-    //     bit đã được giữ; bước này là phòng hờ).
-    _log('🔧 Đảm bảo quyền execute (dirs + bin/sbin)...');
-    try {
-      await Process.run(
-        'find', [rootfs, '-type', 'd', '-exec', 'chmod', 'a+rx', '{}', '+'],
-      );
-      for (final d in [
-        'bin', 'sbin', 'usr/bin', 'usr/sbin',
-        'usr/local/bin', 'usr/local/sbin',
-      ]) {
-        final p = '$rootfs/$d';
-        if (Directory(p).existsSync()) {
-          await Process.run(
-            'find', [p, '-type', 'f', '-exec', 'chmod', 'a+x', '{}', '+'],
-          );
-        }
-      }
-    } catch (e) {
-      _log('⚠️ chmod thất bại: $e');
+    // ── FIX: KHÔI PHỤC LẠI LOGIC CHMOD GỐC ──
+    // Bản update trước dùng `chmod a+x` cho các file trong bin/ đã làm mất
+    // quyền đọc (+r) của busybox, dẫn đến lỗi "'/bin/sh' is not executable".
+    // Quay lại dùng `chmod -R a+rx` cho toàn bộ rootfs như code gốc của bạn.
+    _log('🔧 Cấp quyền execute cho toàn bộ rootfs...');
+    final chmodResult = await Process.run('chmod', ['-R', 'a+rx', rootfs]);
+    if (chmodResult.exitCode != 0) {
+      _log('⚠️ chmod -R a+rx $rootfs thất bại (exit ${chmodResult.exitCode}): '
+          '${chmodResult.stderr}');
     }
 
     if (distro.id == 'alpine') {
@@ -440,8 +388,6 @@ class PRootService {
       }
     }
 
-    // Tạo sẵn thư mục chuẩn + resolv.conf (bao gồm etc/ — trước đây thiếu
-    // nếu tarball không có etc/ do layout khác).
     for (final d in ['proc', 'sys', 'dev', 'tmp', 'root', 'etc']) {
       Directory('$rootfs/$d').createSync(recursive: true);
     }
@@ -455,13 +401,6 @@ class PRootService {
     }
   }
 
-  /// Giải nén 1 tar stream (đã giải nén sẵn khỏi gzip/xz) ra [rootfs].
-  ///
-  /// Có 2 lớp bảo vệ **path traversal**:
-  ///  1. Entry name không được resolve ra ngoài rootfs (chặn `../../etc`).
-  ///  2. Symlink target (nếu là relative) không được trỏ ra ngoài rootfs.
-  ///     Symlink tuyệt đối (`/usr/bin/foo`) được giữ nguyên — sẽ resolve
-  ///     bên trong proot rootfs lúc runtime.
   Future<(int, int, int)> _extractTarStream(
     Stream<List<int>> tarStream,
     String rootfs, {
@@ -633,7 +572,6 @@ class PRootService {
       }
     });
 
-    // ── FIX: đảm bảo Completer exitCode luôn được complete dù JNI throw ──
     int exitCode = -1;
     try {
       exitCode = await ProotJNI.runProot(
@@ -653,7 +591,7 @@ class PRootService {
       _logSub = null;
       fake.closeStdout();
       fake.closeStderr();
-      fake.setExitCode(exitCode); // LUÔN complete completer
+      fake.setExitCode(exitCode);
       _running = false;
       onProcessExited?.call();
     }
