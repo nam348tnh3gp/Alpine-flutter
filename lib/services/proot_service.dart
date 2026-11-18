@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:tar/tar.dart';
 import 'package:http/http.dart' as http;
 import 'package:archive/archive.dart' show XZDecoder;
+import 'package:path/path.dart' as p;
 import 'native_bridge.dart';
 import '../proot_jni.dart';
 import '../models/distro.dart';
@@ -137,26 +138,102 @@ class PRootService {
     return null;
   }
 
-  Future<void> bootstrap({required void Function(double) onProgress}) async {
-    final abi = await NativeBridge.getAbi();
-    if (!distro.supportsAbi(abi)) {
-      throw Exception(
-          '${distro.displayName} không hỗ trợ ABI thiết bị này ($abi).');
-    }
-    final rootfs = await _rootfsDir();
-    final filesDir = await NativeBridge.getFilesDir();
-    final libDir = await NativeBridge.getNativeLibraryDir();
+  // ─────────────────────────────────────────────────────────────────────
+  // Download: retry + mirror fallback
+  // ─────────────────────────────────────────────────────────────────────
 
-    if (await Directory(rootfs).exists()) {
-      await Directory(rootfs).delete(recursive: true);
+  Future<bool> _downloadWithFallback({
+    required List<String> urls,
+    required File dest,
+    required void Function(double) onProgress,
+  }) async {
+    final client = http.Client();
+    try {
+      for (var i = 0; i < urls.length; i++) {
+        final url = urls[i];
+        for (var attempt = 0; attempt < 2; attempt++) {
+          if (i > 0 || attempt > 0) {
+            _log('🔁 Thử lại ($url) — lần ${attempt + 1}');
+          }
+          if (attempt > 0) {
+            await Future.delayed(Duration(seconds: 1 << (attempt - 1)));
+          }
+          final ok = await _downloadOnce(client, url, dest, onProgress);
+          if (ok) return true;
+        }
+      }
+      return false;
+    } finally {
+      client.close();
     }
-    Directory(rootfs).createSync(recursive: true);
+  }
 
-    // ── Xác định URL tải tarball ──
-    final String url;
+  Future<bool> _downloadOnce(
+    http.Client client,
+    String url,
+    File dest,
+    void Function(double) onProgress,
+  ) async {
+    IOSink? sink;
+    try {
+      final request = http.Request('GET', Uri.parse(url));
+      final response = await client
+          .send(request)
+          .timeout(const Duration(seconds: 20));
+
+      if (response.statusCode != 200) {
+        _log('❌ HTTP ${response.statusCode} từ $url');
+        return false;
+      }
+
+      final total = response.contentLength ?? 0;
+      var received = 0;
+      sink = dest.openWrite();
+
+      await for (final chunk
+          in response.stream.timeout(const Duration(seconds: 30))) {
+        sink.add(chunk);
+        received += chunk.length;
+        if (total > 0) {
+          onProgress(received / total * 0.7);
+        } else {
+          onProgress(0.10 + ((received ~/ (1024 * 1024)) % 40) / 40 * 0.59);
+        }
+      }
+
+      await sink.flush();
+      await sink.close();
+      sink = null;
+
+      if (received == 0) {
+        _log('❌ Tải thất bại: file rỗng ($url)');
+        return false;
+      }
+      if (total > 0 && received < total) {
+        _log('⚠️ Tải không đầy đủ: $received/$total bytes ($url)');
+        return false;
+      }
+      return true;
+    } catch (e) {
+      try { await sink?.close(); } catch (_) {}
+      try { if (dest.existsSync()) dest.deleteSync(); } catch (_) {}
+      _log('❌ Tải lỗi ($url): $e');
+      return false;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // URL resolution (Alpine / Gentoo resolve động)
+  // ─────────────────────────────────────────────────────────────────────
+
+  Future<List<String>> _resolveUrls(String abi) async {
+    // Static URLs (có thể nhiều mirror)
     if (distro.archUrls.containsKey(abi)) {
-      url = distro.archUrls[abi]!;
-    } else if (distro.gentooAutobuilds?.containsKey(abi) ?? false) {
+      return List<String>.from(distro.archUrls[abi]!);
+    }
+
+    // Gentoo: đọc latest-stage3-*.txt
+    if (distro.gentooAutobuilds?.containsKey(abi) ?? false) {
       final cfg = distro.gentooAutobuilds![abi]!;
       _log('🔎 Đang dò bản Gentoo mới nhất ($abi)...\n${cfg.latestUrl}');
       final resp = await http.get(Uri.parse(cfg.latestUrl));
@@ -173,9 +250,13 @@ class PRootService {
       final tarballName = tarballPath.contains('/')
           ? tarballPath.split('/').last
           : tarballPath;
-      url = '${cfg.tarballBaseUrl}$tarballName';
+      final url = '${cfg.tarballBaseUrl}$tarballName';
       _log('   -> tarball: $tarballName');
-    } else if (distro.alpineLatest?.containsKey(abi) ?? false) {
+      return [url];
+    }
+
+    // Alpine: đọc latest-releases.yaml
+    if (distro.alpineLatest?.containsKey(abi) ?? false) {
       final cfg = distro.alpineLatest![abi]!;
       _log('🔎 Đang dò bản Alpine mới nhất ($abi)...\n${cfg.yamlUrl}');
       final resp = await http.get(Uri.parse(cfg.yamlUrl));
@@ -191,66 +272,54 @@ class PRootService {
             'Không tìm thấy ${cfg.variant} trong latest-releases.yaml');
       }
       final tarballName = m.group(0)!;
-      url = '${cfg.baseUrl}$tarballName';
+      final url = '${cfg.baseUrl}$tarballName';
       _log('   -> tarball: $tarballName');
-    } else {
-      throw Exception(
-          'Không xác định được URL tải cho ${distro.displayName} ($abi).');
+      return [url];
     }
 
+    throw Exception(
+        'Không xác định được URL tải cho ${distro.displayName} ($abi).');
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Bootstrap
+  // ─────────────────────────────────────────────────────────────────────
+
+  Future<void> bootstrap({required void Function(double) onProgress}) async {
+    final abi = await NativeBridge.getAbi();
+    if (!distro.supportsAbi(abi)) {
+      throw Exception(
+          '${distro.displayName} không hỗ trợ ABI thiết bị này ($abi).');
+    }
+    final rootfs = await _rootfsDir();
+    final filesDir = await NativeBridge.getFilesDir();
+    final libDir = await NativeBridge.getNativeLibraryDir();
+
+    if (await Directory(rootfs).exists()) {
+      await Directory(rootfs).delete(recursive: true);
+    }
+    Directory(rootfs).createSync(recursive: true);
+
+    // ── Xác định URL(s) ──
+    final urls = await _resolveUrls(abi);
+
     final ext = distro.isXz ? 'tar.xz' : 'tar.gz';
-    _log('📥 Đang tải ${distro.displayName} rootfs ($abi)...\n$url');
+    _log('📥 Đang tải ${distro.displayName} rootfs ($abi)...\n${urls.first}');
 
-    // ── Tải file nén ──
-    final archivePath = '$filesDir/${distro.id}-rootfs.$ext';
-    final archiveFile = File(archivePath);
-
+    final archiveFile = File('$filesDir/${distro.id}-rootfs.$ext');
     if (archiveFile.existsSync()) {
       try { archiveFile.deleteSync(); } catch (_) {}
     }
 
-    final client = http.Client();
-    IOSink? sink;
-    try {
-      final request = http.Request('GET', Uri.parse(url));
-      final response = await client.send(request);
-
-      if (response.statusCode != 200) {
-        throw Exception('Tải rootfs thất bại: HTTP ${response.statusCode}.');
-      }
-
-      final total = response.contentLength ?? 0;
-      var received = 0;
-      sink = archiveFile.openWrite();
-
-      await for (final chunk in response.stream) {
-        sink.add(chunk);
-        received += chunk.length;
-        if (total > 0) {
-          onProgress(received / total * 0.7);
-        } else {
-          onProgress(0.10 + ((received ~/ (1024 * 1024)) % 40) / 40 * 0.59);
-        }
-      }
-
-      await sink.flush();
-      await sink.close();
-      sink = null;
-
-      if (total > 0 && received < total) {
-        throw Exception(
-            'Tải rootfs không đầy đủ: $received/$total bytes.');
-      }
-      if (received == 0) {
-        throw Exception('Tải rootfs thất bại: file rỗng.');
-      }
-    } catch (e) {
-      try { await sink?.close(); } catch (_) {}
+    // ── Tải (retry + mirror fallback) ──
+    final downloaded = await _downloadWithFallback(
+      urls: urls,
+      dest: archiveFile,
+      onProgress: onProgress,
+    );
+    if (!downloaded) {
       try { if (archiveFile.existsSync()) archiveFile.deleteSync(); } catch (_) {}
-      _log('❌ Tải rootfs thất bại: $e');
-      rethrow;
-    } finally {
-      client.close();
+      throw Exception('Tất cả mirror đều thất bại cho ${distro.displayName}.');
     }
 
     onProgress(0.72);
@@ -267,7 +336,7 @@ class PRootService {
       final xzBin = await _ensureXzBinary(libDir, filesDir);
       if (xzBin != null) {
         _log('   -> dùng native xz (stream, RAM thấp)');
-        final proc = await Process.start(xzBin, ['-d', '-c', archivePath]);
+        final proc = await Process.start(xzBin, ['-d', '-c', archiveFile.path]);
 
         // Drain stderr để pipe không bị đầy (xz in warning ra stderr).
         final stderrBuf = StringBuffer();
@@ -276,9 +345,14 @@ class PRootService {
             .listen(stderrBuf.write);
 
         try {
-          // TarReader consume trực tiếp stdout của xz → không cần buffer
-          // toàn bộ tar vào RAM.
-          final counts = await _extractTarStream(proc.stdout, rootfs);
+          final counts = await _extractTarStream(
+            proc.stdout,
+            rootfs,
+            onProgress: (n) {
+              // Scale progress từ 0.72 → 0.87 trong lúc extract.
+              onProgress((0.72 + 0.15 * ((n % 200) / 200)).clamp(0.72, 0.87));
+            },
+          );
           final exitCode = await proc.exitCode;
           if (exitCode != 0) {
             throw Exception(
@@ -308,7 +382,13 @@ class PRootService {
     } else {
       _log('📦 Giải nén rootfs bằng package:tar (hỗ trợ symlink đầy đủ)...');
       final tarStream = archiveFile.openRead().transform(gzip.decoder);
-      final counts = await _extractTarStream(tarStream, rootfs);
+      final counts = await _extractTarStream(
+        tarStream,
+        rootfs,
+        onProgress: (n) {
+          onProgress((0.72 + 0.15 * ((n % 200) / 200)).clamp(0.72, 0.87));
+        },
+      );
       fileCount = counts.$1;
       dirCount = counts.$2;
       linkCount = counts.$3;
@@ -320,11 +400,31 @@ class PRootService {
       await archiveFile.delete();
     } catch (_) {}
 
-    _log('🔧 Cấp quyền execute cho toàn bộ rootfs...');
-    final chmodResult = await Process.run('chmod', ['-R', 'a+rx', rootfs]);
-    if (chmodResult.exitCode != 0) {
-      _log('⚠️ chmod -R a+rX $rootfs thất bại (exit ${chmodResult.exitCode}): '
-          '${chmodResult.stderr}');
+    // ── Quyền execute (tối ưu: chỉ chmod thư mục + bin/sbin) ──
+    // `chmod -R a+rx` trên Arch/Gentoo (800MB+) cực chậm và không cần thiết:
+    //   • Permission của file đã được tar giữ nguyên từ tarball.
+    //   • Chỉ cần đảm bảo MỌI THƯ MỤC có +x (traversal) và các binary
+    //     cốt lõi trong bin/sbin có +x (Android có thể strip khi extract
+    //     tarball nếu là root, nhưng ở đây ta extract bằng chính app nên
+    //     bit đã được giữ; bước này là phòng hờ).
+    _log('🔧 Đảm bảo quyền execute (dirs + bin/sbin)...');
+    try {
+      await Process.run(
+        'find', [rootfs, '-type', 'd', '-exec', 'chmod', 'a+rx', '{}', '+'],
+      );
+      for (final d in [
+        'bin', 'sbin', 'usr/bin', 'usr/sbin',
+        'usr/local/bin', 'usr/local/sbin',
+      ]) {
+        final p = '$rootfs/$d';
+        if (Directory(p).existsSync()) {
+          await Process.run(
+            'find', [p, '-type', 'f', '-exec', 'chmod', 'a+x', '{}', '+'],
+          );
+        }
+      }
+    } catch (e) {
+      _log('⚠️ chmod thất bại: $e');
     }
 
     if (distro.id == 'alpine') {
@@ -340,7 +440,9 @@ class PRootService {
       }
     }
 
-    for (final d in ['proc', 'sys', 'dev', 'tmp', 'root']) {
+    // Tạo sẵn thư mục chuẩn + resolv.conf (bao gồm etc/ — trước đây thiếu
+    // nếu tarball không có etc/ do layout khác).
+    for (final d in ['proc', 'sys', 'dev', 'tmp', 'root', 'etc']) {
       Directory('$rootfs/$d').createSync(recursive: true);
     }
     File('$rootfs/etc/resolv.conf')
@@ -354,20 +456,55 @@ class PRootService {
   }
 
   /// Giải nén 1 tar stream (đã giải nén sẵn khỏi gzip/xz) ra [rootfs].
+  ///
+  /// Có 2 lớp bảo vệ **path traversal**:
+  ///  1. Entry name không được resolve ra ngoài rootfs (chặn `../../etc`).
+  ///  2. Symlink target (nếu là relative) không được trỏ ra ngoài rootfs.
+  ///     Symlink tuyệt đối (`/usr/bin/foo`) được giữ nguyên — sẽ resolve
+  ///     bên trong proot rootfs lúc runtime.
   Future<(int, int, int)> _extractTarStream(
-      Stream<List<int>> tarStream, String rootfs) async {
+    Stream<List<int>> tarStream,
+    String rootfs, {
+    void Function(int extractedCount)? onProgress,
+  }) async {
     var fileCount = 0, dirCount = 0, linkCount = 0;
     final reader = TarReader(tarStream);
+    final rootfsAbs = p.canonicalize(rootfs);
+
+    bool isEntrySafe(String name) {
+      final clean = name.replaceFirst(RegExp(r'^(\./)+'), '');
+      if (clean.isEmpty) return false;
+      final joined = p.canonicalize(p.join(rootfs, clean));
+      if (!p.isWithin(rootfsAbs, joined) && joined != rootfsAbs) {
+        _log('🚫 Bỏ qua entry có path không an toàn: $name');
+        return false;
+      }
+      return true;
+    }
+
+    bool isSymlinkTargetSafe(String linkPath, String target) {
+      if (target.isEmpty) return false;
+      if (target.startsWith('/')) return true; // absolute: OK trong proot
+      final linkDir = p.dirname(p.join(rootfs, linkPath));
+      final resolved = p.canonicalize(p.join(linkDir, target));
+      if (!p.isWithin(rootfsAbs, resolved)) {
+        _log('🚫 Bỏ qua symlink không an toàn: $linkPath -> $target');
+        return false;
+      }
+      return true;
+    }
 
     while (await reader.moveNext()) {
       final entry = reader.current;
       final header = entry.header;
+      if (!isEntrySafe(entry.name)) continue;
       final outPath = '$rootfs/${entry.name}';
 
       switch (header.typeFlag) {
         case TypeFlag.symlink:
           final target = header.linkName;
           if (target == null) break;
+          if (!isSymlinkTargetSafe(entry.name, target)) break;
           Directory(outPath).parent.createSync(recursive: true);
           if (Link(outPath).existsSync() || File(outPath).existsSync()) {
             try {
@@ -394,6 +531,11 @@ class PRootService {
           fileCount++;
           break;
       }
+
+      if (onProgress != null &&
+          (fileCount + dirCount + linkCount) % 200 == 0) {
+        onProgress(fileCount + dirCount + linkCount);
+      }
     }
     return (fileCount, dirCount, linkCount);
   }
@@ -417,11 +559,13 @@ class PRootService {
 
     final prootBin = '$libDir/libproot.so';
     if (!File(prootBin).existsSync()) {
+      _running = false;
       throw Exception('Không tìm thấy libproot.so tại: $prootBin');
     }
 
     final loaderPath = '$libDir/libproot-loader.so';
     if (!File(loaderPath).existsSync()) {
+      _running = false;
       throw Exception(
         'Không tìm thấy $loaderPath.\n'
         'Build lại APK — fetch_native_binaries.sh cần tải loader từ gói '
@@ -489,6 +633,7 @@ class PRootService {
       }
     });
 
+    // ── FIX: đảm bảo Completer exitCode luôn được complete dù JNI throw ──
     int exitCode = -1;
     try {
       exitCode = await ProotJNI.runProot(
@@ -499,18 +644,21 @@ class PRootService {
         cols: cols,
         sessionId: _sessionId,
       );
+    } catch (e) {
+      exitCode = -2;
+      _log('💥 JNI error: $e');
+      rethrow;
     } finally {
       await _logSub?.cancel();
       _logSub = null;
       fake.closeStdout();
       fake.closeStderr();
+      fake.setExitCode(exitCode); // LUÔN complete completer
       _running = false;
       onProcessExited?.call();
     }
 
     _log('Process exited with code $exitCode');
-    fake.setExitCode(exitCode);
-
     return fake;
   }
 
