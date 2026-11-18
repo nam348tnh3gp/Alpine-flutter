@@ -7,10 +7,11 @@ class Distro {
   final String displayName;
   final String description;
 
-  /// abi ('arm64-v8a' | 'armeabi-v7a') -> URL tải tarball trực tiếp.
+  /// abi ('arm64-v8a' | 'armeabi-v7a') -> DANH SÁCH URL tải tarball trực tiếp
+  /// (thử lần lượt; mirror sau là fallback khi mirror trước fail).
   /// Rỗng nếu distro cần resolve URL động (xem [gentooAutobuilds],
   /// [alpineLatest]).
-  final Map<String, String> archUrls;
+  final Map<String, List<String>> archUrls;
 
   /// true nếu tarball nén .tar.xz (cần XZDecoder), false = .tar.gz (gzip).
   final bool isXz;
@@ -131,10 +132,14 @@ class Distros {
     description: 'Ubuntu Base 24.04 LTS (~28MB), dùng apt. Tương thích phần '
         'mềm/tài liệu hướng dẫn rộng rãi nhất.',
     archUrls: {
-      'arm64-v8a':
-          'https://cdimage.ubuntu.com/ubuntu-base/releases/24.04.4/release/ubuntu-base-24.04.4-base-arm64.tar.gz',
-      'armeabi-v7a':
-          'https://cdimage.ubuntu.com/ubuntu-base/releases/24.04.4/release/ubuntu-base-24.04.4-base-armhf.tar.gz',
+      'arm64-v8a': [
+        'https://cdimage.ubuntu.com/ubuntu-base/releases/24.04.4/release/ubuntu-base-24.04.4-base-arm64.tar.gz',
+        'https://mirrors.ustc.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04.4/release/ubuntu-base-24.04.4-base-arm64.tar.gz',
+      ],
+      'armeabi-v7a': [
+        'https://cdimage.ubuntu.com/ubuntu-base/releases/24.04.4/release/ubuntu-base-24.04.4-base-armhf.tar.gz',
+        'https://mirrors.ustc.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04.4/release/ubuntu-base-24.04.4-base-armhf.tar.gz',
+      ],
     },
     markerFile: 'etc/os-release',
   );
@@ -142,20 +147,26 @@ class Distros {
   // ✅ FIX: os.archlinuxarm.org bị lỗi SSL (chứng chỉ không khớp hostname)
   // → Android chặn kết nối HTTPS. Đổi sang mirror BFSU (chứng chỉ
   // Let's Encrypt hợp lệ), vẫn giữ đúng cấu trúc thư mục /os/.
-  // Mirror dự phòng nếu BFSU gặp sự cố:
-  //   https://mirrors.tuna.tsinghua.edu.cn/archlinuxarm/os/
-  //   https://mirrors.ustc.edu.cn/archlinuxarm/os/
-  //   https://mirrors.aliyun.com/archlinuxarm/os/
+  // Mirror dự phòng nếu BFSU gặp sự cố (xếp theo độ ổn định quan sát được):
+  //   TUNA, USTC, Aliyun.
   static const arch = Distro(
     id: 'arch',
     displayName: 'Arch Linux ARM',
     description: 'Rolling release, dùng pacman. LƯU Ý: tarball chính thức '
         '~800MB+ (kèm gói kernel không dùng tới trong proot).',
     archUrls: {
-      'arm64-v8a':
-          'https://mirrors.bfsu.edu.cn/archlinuxarm/os/ArchLinuxARM-aarch64-latest.tar.gz',
-      'armeabi-v7a':
-          'https://mirrors.bfsu.edu.cn/archlinuxarm/os/ArchLinuxARM-armv7-latest.tar.gz',
+      'arm64-v8a': [
+        'https://mirrors.bfsu.edu.cn/archlinuxarm/os/ArchLinuxARM-aarch64-latest.tar.gz',
+        'https://mirrors.tuna.tsinghua.edu.cn/archlinuxarm/os/ArchLinuxARM-aarch64-latest.tar.gz',
+        'https://mirrors.ustc.edu.cn/archlinuxarm/os/ArchLinuxARM-aarch64-latest.tar.gz',
+        'https://mirrors.aliyun.com/archlinuxarm/os/ArchLinuxARM-aarch64-latest.tar.gz',
+      ],
+      'armeabi-v7a': [
+        'https://mirrors.bfsu.edu.cn/archlinuxarm/os/ArchLinuxARM-armv7-latest.tar.gz',
+        'https://mirrors.tuna.tsinghua.edu.cn/archlinuxarm/os/ArchLinuxARM-armv7-latest.tar.gz',
+        'https://mirrors.ustc.edu.cn/archlinuxarm/os/ArchLinuxARM-armv7-latest.tar.gz',
+        'https://mirrors.aliyun.com/archlinuxarm/os/ArchLinuxARM-armv7-latest.tar.gz',
+      ],
     },
     markerFile: 'etc/arch-release',
   );
