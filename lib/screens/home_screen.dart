@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/gestures.dart';
 import 'package:xterm/xterm.dart';
 import '../services/proot_service.dart';
+import '../services/app_settings.dart';
 import '../models/distro.dart';
 
 /// Đối tượng đại diện cho một phiên terminal (tab)
@@ -23,8 +24,16 @@ class TerminalTab {
   // Cỡ chữ mặc định, có thể zoom bằng pinch
   double fontSize = 14.0;
   double pinchBaseFontSize = 14.0; // chỉ set 1 lần khi bắt đầu pinch
+  bool _disposed = false;
 
-  TerminalTab({required this.distro, VoidCallback? onProcessExited}) {
+  TerminalTab({
+    required this.distro,
+    double initialFontSize = 14.0,
+    VoidCallback? onProcessExited,
+  }) {
+    fontSize = initialFontSize.clamp(8.0, 32.0);
+    pinchBaseFontSize = fontSize;
+
     terminal = Terminal(maxLines: 5000);
 
     // Không ép bật bracketed paste. Để xterm tự bật khi shell hỗ trợ (nhận escape sequence).
@@ -40,6 +49,7 @@ class TerminalTab {
   }
 
   void dispose() {
+    _disposed = true;
     proot.stop();
     controller.dispose();
     focusNode.dispose();
@@ -64,11 +74,15 @@ class _HomeScreenState extends State<HomeScreen> {
   double _progress = 0;
   Distro? _installingDistro;
 
+  // Cỡ chữ mặc định của tab mới (load từ AppSettings; save khi pinch xong).
+  double _defaultFontSize = 14.0;
+
   bool get _anyInstalled => _installedMap.values.any((v) => v);
 
   @override
   void initState() {
     super.initState();
+    _loadSettings();
     _checkInstalled();
   }
 
@@ -78,6 +92,19 @@ class _HomeScreenState extends State<HomeScreen> {
       tab.dispose();
     }
     super.dispose();
+  }
+
+  Future<void> _loadSettings() async {
+    final v = await AppSettings.getFontSize();
+    if (!mounted) return;
+    setState(() {
+      _defaultFontSize = v.clamp(8.0, 32.0);
+      // Áp dụng cho các tab đã có (nếu tạo trước khi load xong).
+      for (final t in _tabs) {
+        t.fontSize = _defaultFontSize;
+        t.pinchBaseFontSize = _defaultFontSize;
+      }
+    });
   }
 
   // ==================== Kiểm tra & cài đặt rootfs ====================
@@ -122,7 +149,7 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     // Tạo một tab tạm để hiển thị log trong quá trình cài
-    final tempTab = TerminalTab(distro: distro);
+    final tempTab = TerminalTab(distro: distro, initialFontSize: _defaultFontSize);
     setState(() {
       _tabs.add(tempTab);
       _currentTabIndex = _tabs.length - 1;
@@ -186,6 +213,7 @@ class _HomeScreenState extends State<HomeScreen> {
     late final TerminalTab tab;
     tab = TerminalTab(
       distro: distro,
+      initialFontSize: _defaultFontSize,
       onProcessExited: () {
         if (mounted) {
           setState(() {
@@ -311,12 +339,13 @@ class _HomeScreenState extends State<HomeScreen> {
     tab.proot.stop();
     tab.terminal.write('\r\n🛑 Đã yêu cầu dừng tiến trình.\r\n');
     Future.delayed(const Duration(seconds: 3), () {
-      if (mounted && tab.stopping) {
-        setState(() {
-          tab.stopping = false;
-          tab.running = false;
-        });
-      }
+      if (!mounted) return;
+      if (!_tabs.contains(tab)) return; // tab đã bị đóng — không setState
+      if (!tab.stopping) return;
+      setState(() {
+        tab.stopping = false;
+        tab.running = false;
+      });
     });
   }
 
@@ -380,14 +409,41 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // ==================== Xử lý modifier & sanitize ====================
 
+  /// Bảng đầy đủ Control (theo ASCII):
+  ///   Ctrl+A..Z    → 0x01..0x1A
+  ///   Ctrl+@/Space → NUL
+  ///   Ctrl+[       → ESC
+  ///   Ctrl+\       → FS  (0x1C)
+  ///   Ctrl+]       → GS  (0x1D)
+  ///   Ctrl+^       → RS  (0x1E)
+  ///   Ctrl+_/-     → US  (0x1F)
+  ///   Ctrl+?       → DEL
   String _applyCtrl(String input) {
-    if (input.length == 1) {
-      final code = input.codeUnitAt(0);
-      if (code >= 65 && code <= 90) {
-        return String.fromCharCode(code - 64);
-      } else if (code >= 97 && code <= 122) {
-        return String.fromCharCode(code - 96);
-      }
+    if (input.length != 1) return input;
+    final code = input.codeUnitAt(0);
+    if (code >= 0x41 && code <= 0x5A) {
+      return String.fromCharCode(code - 0x40);
+    }
+    if (code >= 0x61 && code <= 0x7A) {
+      return String.fromCharCode(code - 0x60);
+    }
+    switch (input) {
+      case '@':
+      case ' ':
+        return '\x00';
+      case '[':
+        return '\x1b';
+      case '\\':
+        return '\x1c';
+      case ']':
+        return '\x1d';
+      case '^':
+        return '\x1e';
+      case '_':
+      case '-':
+        return '\x1f';
+      case '?':
+        return '\x7f';
     }
     return input;
   }
@@ -539,7 +595,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             )
           else if (!_anyInstalled)
-            _buildDistroPicker()
+            Expanded(child: _buildDistroPicker())   // 👈 FIX overflow
           else if (_tabs.isEmpty || _currentTabIndex == null)
             _buildBootingIndicator(),
           if (_tabs.isNotEmpty) _buildTabBar(),
@@ -704,6 +760,11 @@ class _HomeScreenState extends State<HomeScreen> {
           tab.fontSize = (tab.pinchBaseFontSize * details.scale).clamp(8.0, 32.0);
         });
       },
+      onScaleEnd: (_) {
+        // Lưu cỡ chữ làm mặc định cho các tab sau.
+        _defaultFontSize = tab.fontSize;
+        AppSettings.setFontSize(tab.fontSize);
+      },
       child: TerminalView(
         tab.terminal,
         controller: tab.controller,
@@ -721,14 +782,16 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  // 👇 FIX overflow: bọc SingleChildScrollView + Expanded ở build()
   Widget _buildDistroPicker() {
-    return Padding(
+    return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const Text('🐧 Chọn distro để cài', style: TextStyle(fontWeight: FontWeight.bold)),
+          const Text('🐧 Chọn distro để cài',
+              style: TextStyle(fontWeight: FontWeight.bold)),
           const SizedBox(height: 12),
           ...Distros.all.map((d) => _buildDistroCard(d)),
         ],
